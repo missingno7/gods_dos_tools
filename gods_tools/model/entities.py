@@ -291,7 +291,7 @@ def build_entity_index(document: LevelDocument) -> EntityIndex:
             IndexedEntity(
                 key=EntityKey("flying_path", path.index),
                 group="Flying paths",
-                label=f"P{path.index}",
+                label=f"FP{path.index}",
                 selection_kind="path",
                 payload=path,
                 pixel_x=None,

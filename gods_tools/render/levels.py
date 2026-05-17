@@ -468,7 +468,7 @@ def _draw_flying_wave_paths(
             last_x, last_y = points[-1]
             draw.ellipse((first_x - 4, first_y - 4, first_x + 4, first_y + 4), outline=color, width=2)
             draw.rectangle((last_x - 3, last_y - 3, last_x + 3, last_y + 3), outline=color, width=2)
-            _label(draw, first_x + 7, first_y - 7, f"FW{wave_index}/P{path.index}", color)
+            _label(draw, first_x + 7, first_y - 7, f"FW{wave_index}/FP{path.index}", color)
     image.alpha_composite(overlay)
 
 
@@ -1156,7 +1156,7 @@ def _build_flying_path_canvas_overlay(
             markers.append(OverlayMarker(points[0][0], points[0][1], None, color, shape="ring"))
             markers.append(OverlayMarker(points[-1][0], points[-1][1], None, color, shape="square"))
             if selected_event_index == event_index or selected_flying_path_index == wave.flying_path_index:
-                markers.append(OverlayMarker(points[0][0], points[0][1], f"FW{wave_index}/P{path.index}", color, shape="label_only"))
+                markers.append(OverlayMarker(points[0][0], points[0][1], f"FW{wave_index}/FP{path.index}", color, shape="label_only"))
     return _merge_canvas_overlays(CanvasOverlay(lines=tuple(lines), markers=tuple(markers)))
 
 

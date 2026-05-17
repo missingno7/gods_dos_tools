@@ -683,16 +683,16 @@ class LevelViewer(ttk.Frame):
     def _describe_selected_flying_path(self, path_index: int) -> str:
         assert self.loaded is not None
         if self.loaded.flying_paths is None:
-            return f"Flying path P{path_index} is unavailable."
+            return f"Flying path FP{path_index} is unavailable."
         path = self.loaded.flying_paths.get(path_index)
         if path is None:
-            return f"Flying path P{path_index} does not exist in this level bank."
+            return f"Flying path FP{path_index} does not exist in this level bank."
 
         lines = [
             "Flying path inspector",
             "=====================",
             "",
-            f"Path: P{path.index}",
+            f"Path: FP{path.index}",
             f"Type: {path.kind}",
             f"Nodes: {len(path.deltas)}",
             f"Base: ({path.base_x}, {path.base_y})",
@@ -786,7 +786,7 @@ class LevelViewer(ttk.Frame):
             lines.extend([
                 "",
                 "Flying path:",
-                f"  P{wave.flying_path_index}" + (f" ({path.kind}, nodes={len(path.deltas)})" if path is not None else " (missing .PAT decode)"),
+                f"  FP{wave.flying_path_index}" + (f" ({path.kind}, nodes={len(path.deltas)})" if path is not None else " (missing .PAT decode)"),
             ])
         elif selection.anchor_x is not None and selection.anchor_y is not None:
             lines.extend(["", f"Map anchor: ({selection.anchor_x}, {selection.anchor_y})"])
@@ -1173,7 +1173,7 @@ class LevelViewer(ttk.Frame):
                             "\n\nFlying path details:"
                             f"\n  Wave: FW{wave.index}"
                             f"\n  Enemy: {self._enemy_summary(wave, 'flying')}"
-                            f"\n  Path: P{path.index} ({path.kind})"
+                            f"\n  Path: FP{path.index} ({path.kind})"
                             f"\n  Nodes: {len(path.deltas)}"
                             f"\n  Base: ({path.base_x}, {path.base_y})"
                             f"\n  Reward: {self._wave_reward_text(wave)}"
@@ -1270,9 +1270,9 @@ class LevelViewer(ttk.Frame):
         wave_text = ", ".join(f"FW{wave.index}" for wave in waves) or "none"
         narrative = describe_component(
             graph,
-            title=f"Mechanism around flying path P{path_index}",
+            title=f"Mechanism around flying path FP{path_index}",
             selection_summary=(
-                f"Selected flying path P{path_index}. Flying waves using it: {wave_text}. "
+                f"Selected flying path FP{path_index}. Flying waves using it: {wave_text}. "
                 f"Known triggering events: {', '.join(f'E{index}' for index in event_indices) or 'none'}."
             ),
             edges=edges,
@@ -1776,7 +1776,7 @@ class LevelViewer(ttk.Frame):
         if hasattr(wave, "facing"):
             self._insert_property(parent, "Facing", getattr(wave, "facing"), source)
         if prefix == "FW":
-            self._insert_property(parent, "Flying path", f"P{wave.flying_path_index}", ".PAT")
+            self._insert_property(parent, "Flying path", f"FP{wave.flying_path_index}", ".PAT")
         info = self._enemy_info(wave, enemy_kind)
         if info is not None:
             self._insert_property(parent, "Sprite", f"DOS #{info.sprite_index_for_facing(getattr(wave, 'facing', 0))}", "sprite table")
@@ -2165,7 +2165,7 @@ class LevelViewer(ttk.Frame):
                         self._insert_property(sources, edge.source.label, edge.label, "logic")
 
     def _insert_flying_path_properties(self, path_index: int) -> None:
-        root = self._insert_property_section(f"Flying path P{path_index}", ".PAT")
+        root = self._insert_property_section(f"Flying path FP{path_index}", ".PAT")
         path = self.loaded.flying_paths.get(path_index) if self.loaded is not None and self.loaded.flying_paths is not None else None
         if path is None:
             self._insert_property(root, "Status", "path unavailable", ".PAT")
@@ -2662,7 +2662,7 @@ class LevelViewer(ttk.Frame):
                         break
                 if not centered:
                     self.map_canvas.center_on_pixel(0, 0)
-            self.inspect_var.set(f"Entity browser selected flying path P{path_index}.")
+            self.inspect_var.set(f"Entity browser selected flying path FP{path_index}.")
         elif ref_kind == "wave":
             self._clear_auto_flying_path_overlay()
             selection = value
