@@ -105,6 +105,12 @@ def _append_group(groups: "OrderedDict[str, list[IndexedEntity]]", name: str, en
         groups[name] = materialized
 
 
+def _entity_label_sort_key(entity: IndexedEntity) -> tuple[str, int, str]:
+    prefix = "".join(ch for ch in entity.label if not ch.isdigit())
+    digits = "".join(ch for ch in entity.label if ch.isdigit())
+    return prefix, int(digits) if digits else -1, entity.label
+
+
 def build_entity_index(document: LevelDocument) -> EntityIndex:
     """Build a normalized selection index from one immutable level document.
 
@@ -173,39 +179,39 @@ def build_entity_index(document: LevelDocument) -> EntityIndex:
         point = LogicPoint(record.marker_x, record.marker_y + 24, f"T{record.index}", "teleport", record.index)
         teleport_entities.append(_point_entity(
             family="teleport",
-            group="Teleport table records",
+            group="Teleports",
             index=record.index,
             label=f"T{record.index}",
             kind="point",
             point=point,
         ))
-    _append_group(groups, "Teleport table records", teleport_entities)
+    _append_group(groups, "Teleports", teleport_entities)
 
     hardcoded_entities: list[IndexedEntity] = []
     for record in special_teleport_destinations(document.level_number):
         point = LogicPoint(record.pixel_x, record.pixel_y + 24, f"HT{record.index}", "hardcoded_teleport_destination", record.index)
         hardcoded_entities.append(_point_entity(
             family="hardcoded_teleport",
-            group="Hardcoded teleport destinations",
+            group="HC teleports",
             index=record.index,
             label=f"HT{record.index}",
             kind="point",
             point=point,
         ))
-    _append_group(groups, "Hardcoded teleport destinations", hardcoded_entities)
+    _append_group(groups, "HC teleports", hardcoded_entities)
 
     objective_entities: list[IndexedEntity] = []
     for record in objective_locations(document.level_number):
-        point = LogicPoint(record.pixel_x, record.pixel_y + 24, f"OBJ{record.index}", "objective_location", record.index)
+        point = LogicPoint(record.pixel_x, record.pixel_y + 24, f"OJE{record.index}", "objective_location", record.index)
         objective_entities.append(_point_entity(
             family="objective_location",
-            group="Objective locations",
+            group="Objectives",
             index=record.index,
-            label=f"OBJ{record.index}",
+            label=f"OJE{record.index}",
             kind="point",
             point=point,
         ))
-    _append_group(groups, "Objective locations", objective_entities)
+    _append_group(groups, "Objectives", objective_entities)
 
     start = player_start_location(document.level_number)
     if start is not None:
@@ -300,37 +306,39 @@ def build_entity_index(document: LevelDocument) -> EntityIndex:
             for path in document.flying_paths.paths
         ))
 
-    target_kinds = {
-        "spawned_object",
-        "spawned_weapon",
-        "door",
-        "backdoor",
-        "backdoor_destination",
-        "backdoor_world",
-        "destructable_object",
-        "spawned_destructable_object",
-        "destroy_type4_unresolved",
-        "destroy_type4_offmap",
+    target_groups: OrderedDict[str, list[IndexedEntity]] = OrderedDict()
+    target_group_by_kind = {
+        "spawned_object": "Logic: spawned",
+        "spawned_weapon": "Logic: spawned",
+        "door": "Logic: doors",
+        "backdoor": "Logic: backdoors",
+        "backdoor_destination": "Logic: backdoors",
+        "backdoor_world": "Logic: backdoors",
+        "destructable_object": "Logic: destructibles",
+        "spawned_destructable_object": "Logic: destructibles",
+        "destroy_type4_unresolved": "Logic: destructibles",
+        "destroy_type4_offmap": "Logic: destructibles",
     }
-    target_entities: list[IndexedEntity] = []
     seen_targets: set[tuple[str, int | None, int, int, str]] = set()
     for point in graph.unique_points():
-        if point.kind not in target_kinds:
+        group_name = target_group_by_kind.get(point.kind)
+        if group_name is None:
             continue
         target_key = (point.kind, point.index, point.pixel_x, point.pixel_y, point.label)
         if target_key in seen_targets:
             continue
         seen_targets.add(target_key)
-        target_entities.append(_point_entity(
+        target_groups.setdefault(group_name, []).append(_point_entity(
             family="logic_target",
-            group="Physical logic targets",
+            group=group_name,
             index=point.index if point.index is not None else point.label,
             variant=point.kind,
             label=point.label,
             kind="point",
             point=point,
         ))
-    _append_group(groups, "Physical logic targets", target_entities)
+    for group_name, entities in target_groups.items():
+        _append_group(groups, group_name, sorted(entities, key=_entity_label_sort_key))
 
     _append_group(groups, "Map items", (
         IndexedEntity(

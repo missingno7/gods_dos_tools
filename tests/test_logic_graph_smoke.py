@@ -1,13 +1,53 @@
 from pathlib import Path
 
-from gods_tools.formats.alfils import load_packed_alfils
+from gods_tools.formats.alfils import AlfilsData, SwitchRecord, load_packed_alfils
 from gods_tools.formats.levels import discover_level_resources
 from gods_tools.formats.logic import build_logic_graph
 from gods_tools.formats.item_tables import level_object_table_path, level_weapon_table_path, load_packed_object_table, load_packed_weapon_table
-from gods_tools.formats.map import load_packed_map
+from gods_tools.formats.map import GodsMap, MapItem, MapPuzzle, RasterInfo, load_packed_map
 
 
 GAME_DIR = Path(__file__).resolve().parents[1] / "game_data" / "Gods"
+
+
+def _unused_puzzle(index: int) -> MapPuzzle:
+    return MapPuzzle(index, (0, 0, 0), (0, 0, 0), 0, 0, 0, 0, 0, 0)
+
+
+def _synthetic_switch_graph():
+    puzzles = [_unused_puzzle(index) for index in range(10)]
+    puzzles[7] = MapPuzzle(7, (11, 9, 0), (0, 2, 0), 160, 160, 13, 0, 0, 0)
+    puzzles[8] = MapPuzzle(8, (11, 9, 0), (0, 2, 0), 192, 160, 13, 0, 0, 0)
+    puzzles[9] = MapPuzzle(9, (9, 0, 0), (2, 0, 0), 224, 160, 13, 0, 0, 0)
+    map_data = GodsMap(
+        source_path=Path("<synthetic>"),
+        packed_size=0,
+        raw_payload=b"",
+        raster=RasterInfo(0, 0, ()),
+        layer_a=bytes(128 * 64),
+        layer_b=bytes(128 * 64),
+        items=(MapItem(20, 96, 96, 42),),
+        puzzle_strings=(),
+        puzzles=tuple(puzzles),
+    )
+    alfils = AlfilsData(
+        source_path=Path("<synthetic>"),
+        packed_size=0,
+        raw_payload=b"",
+        section_offsets=(),
+        flying_waves=(),
+        events=(),
+        walking_waves=(),
+        intel_flying_waves=(),
+        intel_walking_waves=(),
+        switches=(SwitchRecord(0, 96, 96, 42),),
+        teleports=(),
+        trapdoors=(),
+        moving_blocks=(),
+        hints=(),
+        trailing_zero_bytes=b"",
+    )
+    return build_logic_graph(map_data, alfils)
 
 
 def test_logic_graph_decodes_relationships_for_level_1a() -> None:
@@ -115,3 +155,67 @@ def test_logic_graph_exposes_map_item_role_bundle_for_object_inspector() -> None
     assert graph.preferred_point_for_map_item(item_index) is not None
     assert graph.direct_edges_for_map_item(item_index)
     assert graph.related_edges_for_map_item(item_index)
+
+
+def test_switch_map_item_puzzle_links_stay_local_to_direct_switch_conditions() -> None:
+    graph = _synthetic_switch_graph()
+
+    direct_puzzles = {
+        point.index
+        for edge in graph.direct_edges_for_map_item(20)
+        for point in (edge.source, edge.target)
+        if point.kind == "puzzle"
+    }
+    recursive_puzzles = {
+        point.index
+        for edge in graph.related_edges_for_map_item(20, recursive=True)
+        for point in (edge.source, edge.target)
+        if point.kind == "puzzle"
+    }
+    time_points = [point for point in graph.unique_points() if point.kind == "time_condition"]
+
+    assert direct_puzzles == {7, 8}
+    assert recursive_puzzles == {7, 8}
+    assert len(time_points) == 3
+    assert all((point.pixel_x, point.pixel_y) != (0, 0) for point in time_points)
+    assert len({point.label for point in time_points}) == 3
+
+
+def test_active_zero_zero_puzzle_gets_visible_anchor() -> None:
+    puzzles = [_unused_puzzle(index) for index in range(1)]
+    puzzles[0] = MapPuzzle(0, (9, 0, 0), (2, 0, 0), 0, 0, 13, 0, 0, 1)
+    map_data = GodsMap(
+        source_path=Path("<synthetic>"),
+        packed_size=0,
+        raw_payload=b"",
+        raster=RasterInfo(0, 0, ()),
+        layer_a=bytes(128 * 64),
+        layer_b=bytes(128 * 64),
+        items=(),
+        puzzle_strings=(),
+        puzzles=tuple(puzzles),
+    )
+    alfils = AlfilsData(
+        source_path=Path("<synthetic>"),
+        packed_size=0,
+        raw_payload=b"",
+        section_offsets=(),
+        flying_waves=(),
+        events=(),
+        walking_waves=(),
+        intel_flying_waves=(),
+        intel_walking_waves=(),
+        switches=(),
+        teleports=(),
+        trapdoors=(),
+        moving_blocks=(),
+        hints=(),
+        trailing_zero_bytes=b"",
+    )
+    graph = build_logic_graph(map_data, alfils)
+    point = graph.point_for_puzzle(0)
+    time_point = next(point for point in graph.unique_points() if point.kind == "time_condition")
+
+    assert point is not None
+    assert (point.pixel_x, point.pixel_y) != (0, 0)
+    assert (time_point.pixel_x, time_point.pixel_y) != (0, 0)

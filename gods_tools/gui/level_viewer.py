@@ -235,11 +235,11 @@ class LevelViewer(ttk.Frame):
             selectmode="browse",
         )
         self.puzzle_tree.heading("#0", text="Object")
-        self.puzzle_tree.heading("roles", text="Roles")
+        self.puzzle_tree.heading("roles", text="Meaning")
         self.puzzle_tree.heading("links", text="Puzzle links")
         self.puzzle_tree.heading("pos", text="Pos")
         self.puzzle_tree.column("#0", width=75, stretch=False)
-        self.puzzle_tree.column("roles", width=135, stretch=True)
+        self.puzzle_tree.column("roles", width=230, stretch=True)
         self.puzzle_tree.column("links", width=120, stretch=True)
         self.puzzle_tree.column("pos", width=66, stretch=False)
         puzzle_scroll = ttk.Scrollbar(puzzle_frame, orient=tk.VERTICAL, command=self.puzzle_tree.yview)
@@ -805,7 +805,7 @@ class LevelViewer(ttk.Frame):
         for event in matching_events:
             cells = graph.event_cells.get(event.index, ()) if graph is not None else ()
             cells_text = ", ".join(f"({x},{y})" for x, y in cells) or "effect-only"
-            lines.append(f"  E{event.index}: {event.type_name} param={event.param}; cells {cells_text}")
+            lines.append(f"  E{event.index}: {self._event_action_text(event)}; cells {cells_text}")
 
         if selection.event_index is not None:
             lines.extend(["", f"Selected instance came from E{selection.event_index}."])
@@ -974,7 +974,7 @@ class LevelViewer(ttk.Frame):
                     lines.extend(["", "Switch binding:"])
                     if matches:
                         lines.extend(
-                            f"  S{switch.index}: object={switch.object_info_index}, pos=({switch.pixel_x}, {switch.pixel_y})"
+                            f"  S{switch.index}: {self._object_name(switch.object_info_index)}, pos=({switch.pixel_x}, {switch.pixel_y})"
                             for switch in matches
                         )
                     else:
@@ -1432,13 +1432,13 @@ class LevelViewer(ttk.Frame):
                 if event is None:
                     lines.append(f"  E{event_index:03d}: — unused PALFILS slot")
                 else:
-                    lines.append(f"  E{event_index:03d}: {event.type_name:<28} param={event.param}")
+                    lines.append(f"  E{event_index:03d}: {self._event_action_text(event)}")
             if len(event_indices) > 120:
                 lines.append(f"  ... {len(event_indices) - 120} more event indices referenced from layer B")
 
             lines.extend(["", "Switches:"])
             for record in alfils.active_switches[:80]:
-                lines.append(f"  S{record.index:02d}: ({record.pixel_x:4d}, {record.pixel_y:4d}) objectInfo={record.object_info_index}")
+                lines.append(f"  S{record.index:02d}: ({record.pixel_x:4d}, {record.pixel_y:4d}) {self._object_name(record.object_info_index)}")
             if len(alfils.active_switches) > 80:
                 lines.append(f"  ... {len(alfils.active_switches) - 80} more switches")
 
@@ -1737,8 +1737,8 @@ class LevelViewer(ttk.Frame):
     def _insert_property_section(self, title: str, source: str, *, open: bool = True) -> str:
         return self.property_tree.insert("", tk.END, text=title, values=("",), open=open)
 
-    def _insert_property(self, parent: str, field: str, value: object, source: str) -> None:
-        self.property_tree.insert(parent, tk.END, text=field, values=(str(value),))
+    def _insert_property(self, parent: str, field: str, value: object, source: str, *, open: bool = True) -> str:
+        return self.property_tree.insert(parent, tk.END, text=field, values=(str(value),), open=open)
 
     def _event_cells_text(self, event_index: int, *, limit: int = 8) -> str:
         if self.loaded is None or self.loaded.logic_graph is None:
@@ -1783,6 +1783,100 @@ class LevelViewer(ttk.Frame):
             self._insert_property(parent, "Bounds", f"{info.width}x{info.height}px", "enemy table")
             self._insert_property(parent, "Action", info.action_type, "enemy table")
 
+    def _insert_puzzle_effect_fields(self, parent: str, puzzle) -> None:
+        effect = self._insert_property(parent, "Effect", self._effect_text(puzzle), "decoded", open=True)
+        self._insert_property(effect, "Raw type", f"{puzzle.effect_function_index}: {puzzle_effect_name(puzzle.effect_function_index)}", "map")
+        self._insert_property(effect, "Raw param", puzzle.effect_param, "map")
+        self._insert_property(effect, "Remove item after effect", int(puzzle.remove_after_effect), "map")
+
+        effect_type = puzzle.effect_function_index
+        param = puzzle.effect_param
+        if effect_type == 0:
+            self._insert_property(effect, "Object", self._object_name(param), "object table")
+            self._insert_property(effect, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+        elif effect_type == 1:
+            self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table")
+            self._insert_property(effect, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+        elif effect_type in (2, 9):
+            self._insert_property(effect, "Door rectangle", f"{puzzle.pixel_x},{puzzle.pixel_y} 32x48", "map")
+        elif effect_type == 5:
+            self._insert_property(effect, "Event", self._event_trigger_text(param - 1), "PALFILS")
+        elif effect_type == 6:
+            self._insert_property(effect, "Search origin", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+        elif effect_type in (7, 8):
+            self._insert_property(effect, "Trapdoor", f"D{param}", "PALFILS")
+            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.trapdoors):
+                trapdoor = self.loaded.alfils_data.trapdoors[param]
+                self._insert_property(effect, "Trapdoor position", f"{trapdoor.pixel_x},{trapdoor.pixel_y}", "PALFILS")
+        elif effect_type == 10:
+            self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table")
+
+    def _insert_puzzle_condition_fields(self, parent: str, puzzle) -> None:
+        conditions = self._insert_property(parent, "Conditions", "all must pass", "map puzzle", open=True)
+        for slot, (condition_type, param) in enumerate(zip(puzzle.condition_function_indices, puzzle.condition_params)):
+            condition_parent = self._insert_property(
+                conditions,
+                f"Condition {slot}",
+                self._condition_text(condition_type, param),
+                "decoded",
+                open=True,
+            )
+            self._insert_property(condition_parent, "Raw type", f"{condition_type}: {condition_type_name(condition_type)}", "map")
+            self._insert_property(condition_parent, "Raw param", param, "map")
+            if condition_type in (11, 12) and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
+                switch = self.loaded.alfils_data.switches[param]
+                self._insert_property(condition_parent, "Switch record", f"S{switch.index}: {self._object_name(switch.object_info_index)}", "PALFILS")
+                self._insert_property(condition_parent, "Switch position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS")
+            if condition_type in (5, 6):
+                event_index = param - 1
+                self._insert_property(condition_parent, "Event trigger cells", self._event_cells_text(event_index), "map")
+
+    def _insert_event_effect_tree(self, parent: str, event) -> None:
+        effect = self._insert_property(parent, "Effect", event.type_name, "PALFILS", open=True)
+        self._insert_property(effect, "Raw type", event.event_type_index, "PALFILS")
+        self._insert_property(effect, "Raw param", event.param, "PALFILS")
+
+        wave_target = self._wave_target_for_event(event)
+        if wave_target is not None:
+            prefix, wave, enemy_kind, title = wave_target
+            param = self._insert_property(effect, "Param: wave", f"{prefix}{event.param}", "PALFILS", open=True)
+            self._insert_property(param, "Meaning", title, "decoded")
+            self._insert_wave_fields(param, prefix, wave, enemy_kind, "PALFILS")
+            return
+
+        if event.event_type_index == 2 and self.loaded.map_data is not None:
+            puzzle = self.loaded.map_data.puzzles[event.param] if 0 <= event.param < len(self.loaded.map_data.puzzles) else None
+            param = self._insert_property(effect, "Param: puzzle", f"P{event.param}", "map puzzle", open=True)
+            if puzzle is None:
+                self._insert_property(param, "Status", "puzzle slot unavailable", "map")
+                return
+            self._insert_property(param, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_puzzle_effect_fields(param, puzzle)
+            self._insert_puzzle_condition_fields(param, puzzle)
+            self._insert_puzzle_condition_summary(param, puzzle.index)
+            return
+
+        if event.event_type_index is not None and 6 <= event.event_type_index <= 9 and self.loaded.alfils_data is not None:
+            block = self.loaded.alfils_data.moving_blocks[event.param] if 0 <= event.param < len(self.loaded.alfils_data.moving_blocks) else None
+            param = self._insert_property(effect, "Param: moving block", f"MB{event.param}", "PALFILS", open=True)
+            if block is None:
+                self._insert_property(param, "Status", "moving block slot unavailable", "PALFILS")
+                return
+            action_index = event.event_type_index - 6
+            self._insert_property(param, "Action", f"A{action_index}: {block.action_description(action_index)}", "PALFILS")
+            self._insert_property(param, "Position", f"{block.pixel_x},{block.pixel_y}", "PALFILS")
+            self._insert_property(param, "Size", f"{block.width_pixels}x{block.height_pixels}px", "PALFILS")
+            return
+
+        if event.event_type_index == 5:
+            self._insert_property(effect, "Param: checkpoint", event.param, "PALFILS")
+        elif event.event_type_index == 10:
+            self._insert_property(effect, "Param: guardian", event.param, "PALFILS")
+        elif event.event_type_index == 11:
+            self._insert_property(effect, "Status", "inactive event slot", "PALFILS")
+        else:
+            self._insert_property(effect, "Decoded param", event.param, "PALFILS")
+
     def _insert_event_properties(self, event_index: int) -> None:
         assert self.loaded is not None
         event = self.loaded.alfils_data.event(event_index) if self.loaded.alfils_data is not None else None
@@ -1791,35 +1885,7 @@ class LevelViewer(ttk.Frame):
         if event is None:
             self._insert_property(root, "Status", "unused PALFILS event slot", "PALFILS")
             return
-        self._insert_property(root, "Event type", event.type_name, "PALFILS")
-        self._insert_property(root, "Param", event.param, "PALFILS")
-
-        wave_target = self._wave_target_for_event(event)
-        if wave_target is not None:
-            prefix, wave, enemy_kind, title = wave_target
-            target = self._insert_property_section(f"Target: spawns {prefix}{wave.index}", "PALFILS")
-            self._insert_property(target, "Meaning", title, "decoded")
-            self._insert_wave_fields(target, prefix, wave, enemy_kind, "PALFILS")
-        elif event.event_type_index == 2 and self.loaded.map_data is not None:
-            puzzle = self.loaded.map_data.puzzles[event.param] if 0 <= event.param < len(self.loaded.map_data.puzzles) else None
-            target = self._insert_property_section(f"Target: checks P{event.param}", "map puzzle")
-            if puzzle is not None:
-                self._insert_property(target, "Effect", f"{puzzle_effect_name(puzzle.effect_function_index)} param={puzzle.effect_param}", "map")
-                conditions = ", ".join(
-                    f"{condition_type_name(kind)}({param})"
-                    for kind, param in zip(puzzle.condition_function_indices, puzzle.condition_params)
-                )
-                self._insert_property(target, "Conditions", conditions, "map")
-                self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
-                self._insert_puzzle_condition_summary(target, puzzle.index)
-        elif event.event_type_index is not None and 6 <= event.event_type_index <= 9 and self.loaded.alfils_data is not None:
-            block = self.loaded.alfils_data.moving_blocks[event.param] if 0 <= event.param < len(self.loaded.alfils_data.moving_blocks) else None
-            target = self._insert_property_section(f"Target: moving block MB{event.param}", "PALFILS")
-            if block is not None:
-                action_index = event.event_type_index - 6
-                self._insert_property(target, "Action", f"A{action_index}: {block.action_description(action_index)}", "PALFILS")
-                self._insert_property(target, "Position", f"{block.pixel_x},{block.pixel_y}", "PALFILS")
-                self._insert_property(target, "Size", f"{block.width_pixels}x{block.height_pixels}px", "PALFILS")
+        self._insert_event_effect_tree(root, event)
 
         if self.loaded.logic_graph is not None:
             graph = self.loaded.logic_graph
@@ -1899,9 +1965,9 @@ class LevelViewer(ttk.Frame):
             else:
                 self._insert_property(roles, "Role", "no decoded direct graph role", "logic")
             links = self._insert_property_section("Puzzle / mechanism links", "logic", open=False)
-            puzzles = self._puzzle_links_for_map_item(item.index, recursive=True)
+            puzzles = self._puzzle_links_for_map_item(item.index, recursive=False)
             self._insert_property(links, "Puzzle records", ", ".join(f"P{index}" for index in puzzles) if puzzles else "none", "logic")
-            self._insert_property(links, "Connected edges", len(graph.related_edges_for_map_item(item.index, recursive=True)), "logic")
+            self._insert_property(links, "Direct edges", len(graph.direct_edges_for_map_item(item.index)), "logic")
 
     def _insert_logic_point_properties(self, point: LogicPoint) -> None:
         root = self._insert_property_section(f"{point.label}: {self._role_label(point.kind)}", "logic")
@@ -1991,7 +2057,7 @@ class LevelViewer(ttk.Frame):
             for record in objective_locations(self.loaded.resource.level):
                 if record.index != point.index:
                     continue
-                section = self._insert_property_section(f"Objective OBJ{record.index}", "PC table")
+                section = self._insert_property_section(f"Objective OJE{record.index}", "PC table")
                 self._insert_property(section, "Cell", f"{record.cell_x},{record.cell_y}", "PC table")
                 self._insert_property(section, "Position", f"{record.pixel_x},{record.pixel_y}", "PC table")
                 self._insert_property(section, "GAME.EXE offset", f"0x{record.unpacked_game_offset:X}", "PC table")
@@ -2011,11 +2077,23 @@ class LevelViewer(ttk.Frame):
         info = self.loaded.object_table.get(object_index)
         return f"OBJ{object_index}: {info.full_name}" if info is not None else f"OBJ{object_index}"
 
+    def _object_ref(self, object_index: int) -> str:
+        if self.loaded is None or self.loaded.object_table is None:
+            return f"OBJ{object_index}"
+        info = self.loaded.object_table.get(object_index)
+        return f"OBJ{object_index} ({info.full_name})" if info is not None else f"OBJ{object_index}"
+
     def _weapon_name(self, weapon_index: int) -> str:
         if self.loaded is None or self.loaded.weapon_table is None:
             return f"WPN{weapon_index}"
         info = self.loaded.weapon_table.get(weapon_index)
         return f"WPN{weapon_index}: {info.full_name}" if info is not None else f"WPN{weapon_index}"
+
+    def _weapon_ref(self, weapon_index: int) -> str:
+        if self.loaded is None or self.loaded.weapon_table is None:
+            return f"WPN{weapon_index}"
+        info = self.loaded.weapon_table.get(weapon_index)
+        return f"WPN{weapon_index} ({info.full_name})" if info is not None else f"WPN{weapon_index}"
 
     def _switch_binding_text(self, switch_index: int) -> str:
         if self.loaded is None or self.loaded.logic_graph is None:
@@ -2032,17 +2110,30 @@ class LevelViewer(ttk.Frame):
             return f"S{switch_index} via {', '.join(sources)}"
         return f"S{switch_index}"
 
+    def _event_action_text(self, event) -> str:
+        target = self._wave_target_for_event(event)
+        if target is not None:
+            prefix, wave, _enemy_kind, _title = target
+            return f"spawn {prefix}{wave.index}"
+        if event.event_type_index == 2:
+            return f"check P{event.param}"
+        if event.event_type_index is not None and 6 <= event.event_type_index <= 9:
+            return f"activate MB{event.param} A{event.event_type_index - 6}"
+        if event.event_type_index == 5:
+            return f"checkpoint {event.param}"
+        if event.event_type_index == 10:
+            return f"load guardian {event.param}"
+        if event.event_type_index == 11:
+            return "inactive"
+        return f"{event.type_name} param={event.param}"
+
     def _event_trigger_text(self, event_index: int) -> str:
         if self.loaded is None or self.loaded.alfils_data is None:
             return f"E{event_index}"
         event = self.loaded.alfils_data.event(event_index)
         if event is None:
             return f"E{event_index}"
-        target = self._wave_target_for_event(event)
-        if target is not None:
-            prefix, wave, _enemy_kind, _title = target
-            return f"E{event_index} ({event.type_name} -> {prefix}{wave.index})"
-        return f"E{event_index} ({event.type_name} param={event.param})"
+        return f"E{event_index} ({self._event_action_text(event)})"
 
     def _condition_text(self, condition_type: int, param: int) -> str:
         name = condition_type_name(condition_type)
@@ -2050,10 +2141,10 @@ class LevelViewer(ttk.Frame):
             return "always true"
         if condition_type in (1, 2):
             verb = "player carries" if condition_type == 1 else "player does not carry"
-            return f"{verb} {self._object_name(param)}"
+            return f"{verb} {self._object_ref(param)}"
         if condition_type in (3, 4):
             verb = "player holds" if condition_type == 3 else "player does not hold"
-            return f"{verb} {self._weapon_name(param)}"
+            return f"{verb} {self._weapon_ref(param)}"
         if condition_type in (5, 6):
             event_index = param - 1
             verb = "event has fired" if condition_type == 5 else "event has not fired"
@@ -2084,9 +2175,9 @@ class LevelViewer(ttk.Frame):
         param = puzzle.effect_param
         name = puzzle_effect_name(effect)
         if effect == 0:
-            return f"spawn {self._object_name(param)}"
+            return f"spawn {self._object_ref(param)}"
         if effect == 1:
-            return f"spawn {self._weapon_name(param)}"
+            return f"spawn {self._weapon_ref(param)}"
         if effect in (2, 9):
             return f"{name} at ({puzzle.pixel_x},{puzzle.pixel_y})"
         if effect == 5:
@@ -2096,17 +2187,25 @@ class LevelViewer(ttk.Frame):
         if effect in (7, 8):
             return f"{name} D{param}"
         if effect == 10:
-            return f"remove {self._weapon_name(param)}"
+            return f"remove {self._weapon_ref(param)}"
         return f"{name} param={param}"
+
+    def _puzzle_condition_meaning(self, puzzle) -> str:
+        conditions = [
+            self._condition_text(kind, param)
+            for kind, param in zip(puzzle.condition_function_indices, puzzle.condition_params)
+            if kind != 0
+        ]
+        return "; ".join(conditions) if conditions else "always"
+
+    def _puzzle_meaning_text(self, puzzle) -> str:
+        return f"if {self._puzzle_condition_meaning(puzzle)} -> {self._effect_text(puzzle)}"
 
     def _insert_puzzle_condition_summary(self, parent: str, puzzle_index: int) -> None:
         if self.loaded is None or not (0 <= puzzle_index < len(self.loaded.map_data.puzzles)):
             return
         puzzle = self.loaded.map_data.puzzles[puzzle_index]
-        summary = "; ".join(
-            self._condition_text(kind, param)
-            for kind, param in zip(puzzle.condition_function_indices, puzzle.condition_params)
-        )
+        summary = self._puzzle_condition_meaning(puzzle)
         self._insert_property(parent, "Readable conditions", summary, "decoded")
 
     def _insert_puzzle_properties(self, puzzle_index: int) -> None:
@@ -2119,36 +2218,13 @@ class LevelViewer(ttk.Frame):
         puzzle = self.loaded.map_data.puzzles[puzzle_index]
         root = self._insert_property_section(f"Puzzle P{puzzle.index}", "map puzzle")
         self._insert_property(root, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
-        self._insert_property(root, "Effect", self._effect_text(puzzle), "decoded")
-        self._insert_property(root, "Remove item after effect", int(puzzle.remove_after_effect), "map")
         if 0 <= puzzle.string_index < len(self.loaded.map_data.puzzle_strings):
             text = self.loaded.map_data.puzzle_strings[puzzle.string_index]
             if text:
                 self._insert_property(root, "Message", text, "map")
 
-        conditions = self._insert_property_section("Conditions", "map puzzle")
-        for slot, (condition_type, param) in enumerate(zip(puzzle.condition_function_indices, puzzle.condition_params)):
-            condition_parent = self.property_tree.insert(
-                conditions,
-                tk.END,
-                text=f"Condition {slot}",
-                values=(self._condition_text(condition_type, param),),
-                open=True,
-            )
-            self._insert_property(condition_parent, "Raw type", f"{condition_type}: {condition_type_name(condition_type)}", "map")
-            self._insert_property(condition_parent, "Raw param", param, "map")
-            if condition_type in (11, 12) and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
-                switch = self.loaded.alfils_data.switches[param]
-                self._insert_property(condition_parent, "Switch record", f"S{switch.index} object={switch.object_info_index}", "PALFILS")
-                self._insert_property(condition_parent, "Switch position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS")
-            if condition_type in (5, 6):
-                event_index = param - 1
-                self._insert_property(condition_parent, "Event trigger cells", self._event_cells_text(event_index), "map")
-
-        effect = self._insert_property_section("Effect target", "map puzzle")
-        self._insert_property(effect, "Action", self._effect_text(puzzle), "decoded")
-        self._insert_property(effect, "Raw effect", f"{puzzle.effect_function_index}: {puzzle_effect_name(puzzle.effect_function_index)}", "map")
-        self._insert_property(effect, "Raw param", puzzle.effect_param, "map")
+        self._insert_puzzle_effect_fields(root, puzzle)
+        self._insert_puzzle_condition_fields(root, puzzle)
         if self.loaded.logic_graph is not None:
             graph = self.loaded.logic_graph
             point = graph.point_for_puzzle(puzzle.index)
@@ -2207,7 +2283,7 @@ class LevelViewer(ttk.Frame):
         if self.loaded is None or self.loaded.logic_graph is None:
             return ()
         graph = self.loaded.logic_graph
-        edges = graph.related_edges_for_map_item(item_index, recursive=recursive)
+        edges = graph.related_edges_for_map_item(item_index, recursive=recursive) if recursive else graph.direct_edges_for_map_item(item_index)
         return tuple(sorted({
             point.index
             for edge in edges
@@ -2256,7 +2332,7 @@ class LevelViewer(ttk.Frame):
                 puzzle_parent,
                 tk.END,
                 text=f"P{puzzle.index}",
-                values=(puzzle_effect_name(puzzle.effect_function_index), links, self._position_text(point.pixel_x, point.pixel_y)),
+                values=(self._puzzle_meaning_text(puzzle), links, self._position_text(point.pixel_x, point.pixel_y)),
             )
             self.puzzle_refs[iid] = ("point", point)
 
@@ -2269,7 +2345,7 @@ class LevelViewer(ttk.Frame):
                 return f"Map item I{self.selected_map_item.item_index} is unavailable."
             graph = self.loaded.logic_graph
             points = graph.points_for_map_item(item.index)
-            puzzle_links = self._puzzle_links_for_map_item(item.index, recursive=True)
+            puzzle_links = self._puzzle_links_for_map_item(item.index, recursive=False)
             lines = [
                 f"Unified object I{item.index}",
                 "=" * (len(str(item.index)) + 17),
@@ -2308,7 +2384,7 @@ class LevelViewer(ttk.Frame):
                 f"Position: ({point.pixel_x}, {point.pixel_y})\n"
                 f"Puzzle links: {', '.join(f'P{index}' for index in puzzles) if puzzles else 'none'}"
             )
-        return "Select a switch, map item, puzzle record, or physical logic target to see its unified puzzle-facing roles."
+        return "Select a switch, map item, puzzle record, or logic target to see its unified puzzle-facing roles."
 
     def _update_puzzle_text(self) -> None:
         if not hasattr(self, "puzzle_text"):
@@ -2358,20 +2434,20 @@ class LevelViewer(ttk.Frame):
             position = " ".join(f"{x},{y}" for x, y in cells[:2]) if cells else "effect-only"
             if len(cells) > 2:
                 position += " …"
-            return f"{event.type_name} param={event.param}", position, "event", event.index
+            return self._event_action_text(event), position, "event", event.index
 
         if group == "Puzzles":
             point = payload
             puzzle = map_data.puzzles[int(entity.key.index)]
-            detail = f"{puzzle_effect_name(puzzle.effect_function_index)} param={puzzle.effect_param}"
+            detail = self._puzzle_meaning_text(puzzle)
             return detail, self._position_text(point.pixel_x, point.pixel_y), "point", point
 
         if group == "Switches":
             point = payload
             record = alfils.switches[int(entity.key.index)]
-            return f"object={record.object_info_index}", self._position_text(point.pixel_x, point.pixel_y), "point", point
+            return self._object_name(record.object_info_index), self._position_text(point.pixel_x, point.pixel_y), "point", point
 
-        if group == "Teleport table records":
+        if group in {"Teleport table records", "Teleports"}:
             point = payload
             record = alfils.teleports[int(entity.key.index)]
             is_bound = any(
@@ -2382,14 +2458,14 @@ class LevelViewer(ttk.Frame):
             detail = f"{status}; srcX={record.src_pixel_x} → dst=({record.normalized_dst_pixel_x},{record.normalized_dst_pixel_y})"
             return detail, self._position_text(point.pixel_x, point.pixel_y), "point", point
 
-        if group == "Hardcoded teleport destinations":
+        if group in {"Hardcoded teleport destinations", "HC teleports"}:
             point = payload
             record = next(record for record in special_teleport_destinations(self.loaded.resource.level) if record.index == int(entity.key.index))
             offset_text = f"EXE@0x{record.unpacked_game_offset:X}" if record.unpacked_game_offset is not None else "patched special destination"
             detail = f"coded=0x{record.coded:04X}; {offset_text}"
             return detail, self._position_text(record.pixel_x, record.pixel_y), "point", point
 
-        if group == "Objective locations":
+        if group in {"Objective locations", "Objectives"}:
             point = payload
             record = next(record for record in objective_locations(self.loaded.resource.level) if record.index == int(entity.key.index))
             detail = f"cell=({record.cell_x},{record.cell_y}); EXE@0x{record.unpacked_game_offset:X}"
@@ -2462,7 +2538,7 @@ class LevelViewer(ttk.Frame):
             detail = f"{path.kind}, nodes={len(path.deltas)}, waves={wave_count}, trigger cells={trigger_count}"
             return detail, "path-only", "path", path.index
 
-        if group == "Physical logic targets":
+        if group == "Physical logic targets" or group.startswith("Logic targets:") or group.startswith("Logic:"):
             point = payload
             detail = point.kind.replace("_", " ")
             position = "off-map" if point.kind == "destroy_type4_offmap" else self._position_text(point.pixel_x, point.pixel_y)
@@ -2774,7 +2850,7 @@ class LevelViewer(ttk.Frame):
             if event is None:
                 event_text = f", event index {event_index}"
             else:
-                event_text = f", event {event_index}: {event.type_name} param={event.param}"
+                event_text = f", event {event_index}: {self._event_action_text(event)}"
             if self.loaded.logic_graph is not None and (self.selected_event_index != event_index or self.selected_logic_point is not None):
                 self._clear_auto_flying_path_overlay()
                 self.selected_event_index = event_index

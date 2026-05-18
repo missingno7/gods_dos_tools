@@ -63,6 +63,10 @@ def test_hidden_spawned_and_player_start_overlays_render() -> None:
         sprite_bank,
     )
     assert result.image.size == (4096, 1024)
+    assert result.canvas_overlay is not None
+    assert result.canvas_overlay.rectangles
+    labels = [marker.label for marker in result.canvas_overlay.markers if marker.label]
+    assert any("->OBJ" in label or "->WPN" in label for label in labels)
 
 
 def test_moving_block_preview_accepts_selected_moving_block() -> None:

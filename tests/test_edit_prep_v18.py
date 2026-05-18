@@ -53,7 +53,7 @@ def test_level_document_and_entity_index_cover_main_browser_groups() -> None:
     assert index.count > 0
     assert index.by_group("Events")
     assert index.by_group("Map items")
-    assert index.by_group("Physical logic targets")
+    assert any(group.startswith("Logic:") for group, _entities in index.counts_by_group())
     assert index.find("event", 0) is not None
 
 

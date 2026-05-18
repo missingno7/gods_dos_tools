@@ -164,23 +164,31 @@ def _weapon_condition_sources(graph: "LogicGraph", weapon_info_index: int) -> tu
     return (LogicPoint(0, 0, f"WPN{weapon_info_index}", "weapon_inventory_ref", weapon_info_index),)
 
 
-def _state_condition_point(cond_type: int, cond_param: int) -> "LogicPoint" | None:
+def _anchored_puzzle_position(index: int, pixel_x: int, pixel_y: int, *, above: bool = False) -> tuple[int, int]:
+    if pixel_x != 0 or pixel_y != 0:
+        return pixel_x, max(0, pixel_y - 18) if above else pixel_y
+    x, y = 16 + (index % 12) * 48, 16 + (index // 12) * 22
+    return x, max(0, y - 18) if above else y
+
+
+def _state_condition_point(puzzle: MapPuzzle, cond_type: int, cond_param: int) -> "LogicPoint" | None:
+    x, y = _anchored_puzzle_position(puzzle.index, puzzle.pixel_x, puzzle.pixel_y, above=True)
     if cond_type == 7:
-        return LogicPoint(0, 0, f"HP>{cond_param}/24", "health_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/HP>{cond_param}/24", "health_condition")
     if cond_type == 8:
-        return LogicPoint(0, 0, f"HP<{cond_param}/24", "health_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/HP<{cond_param}/24", "health_condition")
     if cond_type == 9:
-        return LogicPoint(0, 0, f"TIME>{cond_param * 5}s", "time_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/TIME>{cond_param * 5}s", "time_condition")
     if cond_type == 10:
-        return LogicPoint(0, 0, f"TIME<{cond_param * 5}s", "time_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/TIME<{cond_param * 5}s", "time_condition")
     if cond_type == 13:
-        return LogicPoint(0, 0, f"SCORE>{cond_param * 5000}", "score_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/SCORE>{cond_param * 5000}", "score_condition")
     if cond_type == 14:
-        return LogicPoint(0, 0, f"SCORE<{cond_param * 5000}", "score_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/SCORE<{cond_param * 5000}", "score_condition")
     if cond_type == 15:
-        return LogicPoint(0, 0, f"LIVES>{cond_param}", "lives_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/LIVES>{cond_param}", "lives_condition")
     if cond_type == 16:
-        return LogicPoint(0, 0, f"LIVES<{cond_param}", "lives_condition", cond_param)
+        return LogicPoint(x, y, f"P{puzzle.index}/LIVES<{cond_param}", "lives_condition")
     return None
 
 
@@ -376,7 +384,8 @@ class LogicGraph:
         puzzle = self.map_data.puzzles[index]
         if puzzle.appears_unused:
             return None
-        return LogicPoint(puzzle.pixel_x, puzzle.pixel_y, f"P{index}", "puzzle", index)
+        x, y = _anchored_puzzle_position(index, puzzle.pixel_x, puzzle.pixel_y)
+        return LogicPoint(x, y, f"P{index}", "puzzle", index)
 
     def point_for_switch(self, index: int) -> LogicPoint | None:
         if not (0 <= index < len(self.alfils_data.switches)):
@@ -643,7 +652,18 @@ class LogicGraph:
         points = self.points_for_map_item(item_index)
         selected: list[LogicEdge] = []
         seen_edges: set[int] = set()
+        bound_role_points: list[LogicPoint] = []
         for point in points:
+            for edge in self.direct_edges_for_point(point):
+                edge_id = id(edge)
+                if edge_id in seen_edges:
+                    continue
+                seen_edges.add(edge_id)
+                selected.append(edge)
+                other = edge.target if self._same_graph_node(edge.source, point) else edge.source
+                if edge.edge_kind in {"switch_binding", "teleport_binding"}:
+                    bound_role_points.append(other)
+        for point in bound_role_points:
             for edge in self.direct_edges_for_point(point):
                 edge_id = id(edge)
                 if edge_id in seen_edges:
@@ -1029,7 +1049,7 @@ def build_logic_graph(
                         )
                     )
             else:
-                state_source = _state_condition_point(cond_type, cond_param)
+                state_source = _state_condition_point(puzzle, cond_type, cond_param)
                 if state_source is not None:
                     edges.append(
                         LogicEdge(

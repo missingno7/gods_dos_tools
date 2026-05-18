@@ -262,36 +262,38 @@ def _ghost_sprite(sprite: Image.Image, max_alpha: int = 128) -> Image.Image:
     return ghost
 
 
-def _draw_hidden_spawned_items(
-    image: Image.Image,
+def _hidden_spawned_item_entries(
     map_data: GodsMap,
     sprite_bank: SpriteBank | None,
-) -> None:
-    """Render ghost previews for SpawnObject / SpawnWeapon puzzle effects."""
-
+) -> tuple[tuple[int, int, Image.Image, str], ...]:
     if sprite_bank is None:
-        return
-    draw = ImageDraw.Draw(image)
-    color = (180, 255, 255, 245)
+        return ()
+
+    entries: list[tuple[int, int, Image.Image, str]] = []
     for puzzle in map_data.active_puzzles:
         sprite: Image.Image | None = None
         label = ""
         if puzzle.effect_function_index == 0:  # SpawnObject
             sprite = sprite_bank.object_sprite(puzzle.effect_param)
-            label = f"P{puzzle.index}→OBJ{puzzle.effect_param}"
+            label = f"P{puzzle.index}->OBJ{puzzle.effect_param}"
         elif puzzle.effect_function_index == 1:  # SpawnWeapon
             sprite = sprite_bank.weapon_sprite(puzzle.effect_param)
-            label = f"P{puzzle.index}→WPN{puzzle.effect_param}"
-        if sprite is None:
-            continue
+            label = f"P{puzzle.index}->WPN{puzzle.effect_param}"
+        if sprite is not None:
+            entries.append((puzzle.pixel_x, puzzle.pixel_y, sprite, label))
+    return tuple(entries)
+
+
+def _draw_hidden_spawned_item_sprites(
+    image: Image.Image,
+    map_data: GodsMap,
+    sprite_bank: SpriteBank | None,
+) -> None:
+    """Render ghost sprite previews for SpawnObject / SpawnWeapon puzzle effects."""
+
+    for x, y, sprite, _label_text in _hidden_spawned_item_entries(map_data, sprite_bank):
         ghost = _ghost_sprite(sprite)
-        image.alpha_composite(ghost, (puzzle.pixel_x, puzzle.pixel_y))
-        draw.rectangle(
-            (puzzle.pixel_x, puzzle.pixel_y, puzzle.pixel_x + sprite.width - 1, puzzle.pixel_y + sprite.height - 1),
-            outline=color,
-            width=1,
-        )
-        _label(draw, puzzle.pixel_x + sprite.width + 3, puzzle.pixel_y - 2, label, color)
+        image.alpha_composite(ghost, (x, y))
 
 
 def _draw_map_items(image: Image.Image, map_data: GodsMap) -> None:
@@ -673,7 +675,7 @@ def _draw_objective_locations(image: Image.Image, level: int) -> None:
     draw = ImageDraw.Draw(image)
     for record in objective_locations(level):
         x, y = record.pixel_x, record.pixel_y
-        _rectangle_label(draw, (x, y, x + 31, y + 47), f"OBJ{record.index}", (245, 245, 245, 255))
+        _rectangle_label(draw, (x, y, x + 31, y + 47), f"OJE{record.index}", (245, 245, 245, 255))
 
 
 def _draw_player_start(image: Image.Image, level: int) -> None:
@@ -821,7 +823,7 @@ def _draw_arrow_head(draw: ImageDraw.ImageDraw, start: tuple[int, int], end: tup
 def _point_is_drawable(point) -> bool:
     # Purely logical points have no physical source location in the map. They still belong
     # in the inspector graph, but not as lines to the top-left corner of the bitmap.
-    return point.kind not in {"event_effect", "flying_wave", "checkpoint", "guardian", "destroy_type4_offmap"}
+    return point.kind not in {"event_effect", "flying_wave", "checkpoint", "guardian", "destroy_type4_offmap", "object_inventory_ref", "weapon_inventory_ref", "flying_reward_object", "flying_reward_weapon", "remove_weapon_effect", "raster_effect", "timer_effect"}
 
 
 def _draw_logic_endpoint(draw: ImageDraw.ImageDraw, point, color: tuple[int, int, int, int]) -> None:
@@ -980,6 +982,19 @@ def _build_puzzle_canvas_overlay(map_data: GodsMap) -> CanvasOverlay | None:
     return _merge_canvas_overlays(CanvasOverlay(markers=tuple(markers)))
 
 
+def _build_hidden_spawned_canvas_overlay(
+    map_data: GodsMap,
+    sprite_bank: SpriteBank | None,
+) -> CanvasOverlay | None:
+    color = (180, 255, 255, 255)
+    rects: list[OverlayRect] = []
+    markers: list[OverlayMarker] = []
+    for x, y, sprite, label in _hidden_spawned_item_entries(map_data, sprite_bank):
+        rects.append(OverlayRect(x, y, x + sprite.width - 1, y + sprite.height - 1, color, width=1))
+        markers.append(OverlayMarker(x + sprite.width + 3, y - 2, label, color, shape="label_only"))
+    return _merge_canvas_overlays(CanvasOverlay(markers=tuple(markers), rectangles=tuple(rects)))
+
+
 def _build_enemy_wave_canvas_overlay(alfils_data: AlfilsData) -> CanvasOverlay | None:
     markers: list[OverlayMarker] = []
     markers.extend(OverlayMarker(w.pixel_x, w.pixel_y, None, (255, 100, 100, 255), shape="ring") for w in alfils_data.active_walking_waves)
@@ -1068,7 +1083,7 @@ def _build_special_teleport_canvas_overlay(level: int) -> CanvasOverlay | None:
 
 
 def _build_objective_canvas_overlay(level: int) -> CanvasOverlay | None:
-    rects = [OverlayRect(r.pixel_x, r.pixel_y, r.pixel_x + 31, r.pixel_y + 47, (235, 235, 235, 255), width=1) for r in objective_locations(level)]
+    rects = [OverlayRect(r.pixel_x, r.pixel_y, r.pixel_x + 31, r.pixel_y + 47, (235, 235, 235, 255), width=1, label=f"OJE{r.index}") for r in objective_locations(level)]
     return _merge_canvas_overlays(CanvasOverlay(rectangles=tuple(rects)))
 
 
@@ -1243,7 +1258,7 @@ def render_level_map(
     if options.show_item_sprites:
         _draw_map_item_sprites(image, map_data, sprite_bank)
     if options.show_hidden_spawned_items:
-        _draw_hidden_spawned_items(image, map_data, sprite_bank)
+        _draw_hidden_spawned_item_sprites(image, map_data, sprite_bank)
 
     if options.show_collision_overlay:
         _draw_collision_overlay(image, map_data)
@@ -1252,6 +1267,8 @@ def render_level_map(
         semantic_overlays.append(_build_item_marker_canvas_overlay(map_data))
     if options.show_puzzle_markers:
         semantic_overlays.append(_build_puzzle_canvas_overlay(map_data))
+    if options.show_hidden_spawned_items:
+        semantic_overlays.append(_build_hidden_spawned_canvas_overlay(map_data, sprite_bank))
 
     if options.show_event_overlay:
         semantic_overlays.append(_build_event_canvas_overlay(map_data, alfils_data, options.selected_event_index))
