@@ -53,6 +53,19 @@ class MapItemSelection:
     item_index: int
 
 
+@dataclass(frozen=True)
+class PropertyRow:
+    field: str
+    value: object
+    source: str
+
+
+@dataclass(frozen=True)
+class ConditionParamPresentation:
+    summary: str
+    rows: tuple[PropertyRow, ...] = ()
+
+
 @dataclass
 class LoadedLevel:
     """GUI-side render state around the immutable LevelDocument.
@@ -212,6 +225,9 @@ class LevelViewer(ttk.Frame):
 
         property_frame = ttk.LabelFrame(browse_pane, text="Properties", padding=4)
         browse_pane.add(property_frame, weight=1)
+        self.path_preview_canvas = tk.Canvas(property_frame, height=110, background="#181818", highlightthickness=1, highlightbackground="#606060")
+        self.path_preview_canvas.pack(fill=tk.X, pady=(0, 4))
+        self.path_preview_canvas.pack_forget()
         self.property_tree = ttk.Treeview(
             property_frame,
             columns=("value",),
@@ -223,6 +239,7 @@ class LevelViewer(ttk.Frame):
         self.property_tree.heading("value", text="Value")
         self.property_tree.column("#0", width=130, stretch=False)
         self.property_tree.column("value", width=220, stretch=True)
+        self.browser_property_tree = self.property_tree
         prop_scroll = ttk.Scrollbar(property_frame, orient=tk.VERTICAL, command=self.property_tree.yview)
         self.property_tree.configure(yscrollcommand=prop_scroll.set)
         self.property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1651,125 +1668,12 @@ class LevelViewer(ttk.Frame):
         }
         return labels.get(kind, kind.replace("_", " "))
 
-    def _property_rows_for_selection(self) -> list[tuple[str, str, str]]:
-        if self.loaded is None:
-            return []
-        graph = self.loaded.logic_graph
-        rows: list[tuple[str, str, str]] = []
-
-        if self.selected_map_item is not None:
-            item = self._map_item_for_selection(self.selected_map_item)
-            if item is None:
-                return [("Selection", f"I{self.selected_map_item.item_index}", "map")]
-            rows.extend([
-                ("Entity", f"I{item.index}", "map"),
-                ("Kind", "weapon" if item.is_weapon else "object", "map"),
-                ("Position X", str(item.pixel_x), "map"),
-                ("Position Y", str(item.pixel_y), "map"),
-                ("Raw ID", f"{item.object_or_weapon_info_index} / 0x{item.object_or_weapon_info_index:04X}", "map"),
-            ])
-            sprite = self._map_item_sprite(item)
-            if sprite is not None:
-                rows.append(("Sprite box", f"{sprite.width}x{sprite.height}", "sprite"))
-            if item.is_weapon:
-                weapon_index = item.object_or_weapon_info_index - 192
-                info = self.loaded.weapon_table.get(weapon_index) if self.loaded.weapon_table is not None else None
-                rows.append(("Weapon", f"WPN{weapon_index}", "table"))
-                if info is not None:
-                    rows.extend([
-                        ("Name", info.full_name, "table"),
-                        ("Value", str(info.value), "table"),
-                        ("Power", f"{info.base_power}/{info.current_power}", "table"),
-                    ])
-            else:
-                object_index = item.object_or_weapon_info_index
-                info = self.loaded.object_table.get(object_index) if self.loaded.object_table is not None else None
-                rows.append(("Object", f"OBJ{object_index}", "table"))
-                if info is not None:
-                    rows.extend([
-                        ("Name", info.full_name, "table"),
-                        ("Type", f"{info.type_name} ({info.type_index})", "table"),
-                        ("Value", str(info.value), "table"),
-                    ])
-                    if info.effect_name is not None:
-                        rows.append(("Usable effect", f"{info.effect_name} ({info.effect_index})", "table"))
-            if graph is not None:
-                points = graph.points_for_map_item(item.index)
-                if points:
-                    rows.append(("Roles", ", ".join(self._role_label(point.kind) for point in points), "logic"))
-                puzzles = sorted({
-                    point.index
-                    for edge in graph.related_edges_for_map_item(item.index, recursive=False)
-                    for point in (edge.source, edge.target)
-                    if point.kind == "puzzle" and point.index is not None
-                })
-                if puzzles:
-                    rows.append(("Puzzle links", ", ".join(f"P{index}" for index in puzzles), "logic"))
-            return rows
-
-        if self.selected_logic_point is not None:
-            point = self.selected_logic_point
-            rows.extend([
-                ("Entity", point.label, "logic"),
-                ("Kind", self._role_label(point.kind), "logic"),
-                ("Position X", str(point.pixel_x), "logic"),
-                ("Position Y", str(point.pixel_y), "logic"),
-            ])
-            if point.index is not None:
-                rows.append(("Index", str(point.index), "logic"))
-            if graph is not None:
-                rows.append(("Direct links", str(len(graph.direct_edges_for_point(point))), "logic"))
-                puzzles = sorted({
-                    other.index
-                    for edge in graph.related_edges_for_point(point, recursive=False)
-                    for other in (edge.source, edge.target)
-                    if other.kind == "puzzle" and other.index is not None
-                })
-                if puzzles:
-                    rows.append(("Puzzle links", ", ".join(f"P{index}" for index in puzzles), "logic"))
-            return rows
-
-        if self.selected_event_index is not None:
-            event = self.loaded.alfils_data.event(self.selected_event_index) if self.loaded.alfils_data is not None else None
-            rows.append(("Entity", f"E{self.selected_event_index}", "logic"))
-            if event is not None:
-                rows.extend([
-                    ("Type", event.type_name, "PALFILS"),
-                    ("Param", str(event.param), "PALFILS"),
-                ])
-            cells = graph.event_cells.get(self.selected_event_index, ()) if graph is not None else ()
-            rows.append(("Map cells", ", ".join(f"{x},{y}" for x, y in cells[:4]) or "effect-only", "map"))
-            return rows
-
-        if self.selected_enemy_wave is not None:
-            wave = self._wave_from_selection(self.selected_enemy_wave)
-            rows.append(("Entity", f"{self.selected_enemy_wave.category}{self.selected_enemy_wave.wave_index}", "PALFILS"))
-            if wave is not None:
-                rows.extend([
-                    ("Count", str(wave.enemy_count), "PALFILS"),
-                    ("Health", str(wave.health), "PALFILS"),
-                    ("Enemy", self._enemy_summary(wave, self._selection_enemy_kind(self.selected_enemy_wave)), "table"),
-                    ("Reward", self._wave_reward_text(wave), "table"),
-                ])
-            return rows
-
-        if self.selected_flying_path_index is not None:
-            rows.append(("Entity", f"P{self.selected_flying_path_index}", ".PAT"))
-            path = self.loaded.flying_paths.get(self.selected_flying_path_index) if self.loaded.flying_paths is not None else None
-            if path is not None:
-                rows.extend([
-                    ("Type", path.kind, ".PAT"),
-                    ("Nodes", str(len(path.deltas)), ".PAT"),
-                    ("Base", f"{path.base_x},{path.base_y}", ".PAT"),
-                ])
-            return rows
-
-        return [("Selection", "None", "viewer")]
-
     def _update_entity_properties(self) -> None:
         if not hasattr(self, "property_tree"):
             return
         self.property_tree.delete(*self.property_tree.get_children())
+        if getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+            self._set_flying_path_preview(None)
         if self.loaded is None:
             return
         if self.selected_event_index is not None:
@@ -1846,6 +1750,48 @@ class LevelViewer(ttk.Frame):
     def _insert_property(self, parent: str, field: str, value: object, source: str, *, open: bool = True) -> str:
         return self.property_tree.insert(parent, tk.END, text=field, values=(str(value),), open=open)
 
+    def _insert_property_rows(self, parent: str, rows: tuple[PropertyRow, ...]) -> None:
+        for row in rows:
+            self._insert_property(parent, row.field, row.value, row.source)
+
+    def _insert_object_table_properties(self, parent: str, object_index: int, *, title: str = "Object") -> str:
+        section = self._insert_property(parent, title, self._object_name(object_index), "object table", open=True)
+        info = self.loaded.object_table.get(object_index) if self.loaded is not None and self.loaded.object_table is not None else None
+        if info is None:
+            self._insert_property(section, "Status", "object table record unavailable", "object table")
+            return section
+        self._insert_property(section, "Type", f"{info.type_name} ({info.type_index})", "object table")
+        self._insert_property(section, "Value", info.value, "object table")
+        self._insert_property(section, "Sprite", f"DOS #{info.sprite_index}", "object table")
+        if info.effect_name is not None:
+            self._insert_property(section, "Usable effect", f"{info.effect_name} ({info.effect_index})", "object table")
+        if info.is_destructable:
+            self._insert_property(section, "Role", "DestroyType4 target", "decoded")
+        if info.is_chest:
+            keys = [
+                key
+                for key in (self.loaded.object_table.records if self.loaded is not None and self.loaded.object_table is not None else ())
+                if key.opens_chest_object_info(object_index)
+            ]
+            chest = self._insert_property(section, "Chest", "locked treasure container", "decoded", open=True)
+            self._insert_property(chest, "Opened by", ", ".join(self._object_ref(key.index) for key in keys) if keys else "unknown key", "decoded")
+        if info.is_chest_key and self.loaded is not None and self.loaded.object_table is not None:
+            chests = [chest for chest in self.loaded.object_table.records if info.opens_chest_object_info(chest.index)]
+            key = self._insert_property(section, "Chest key", "opens matching chest object", "decoded", open=True)
+            self._insert_property(key, "Opens", ", ".join(self._object_ref(chest.index) for chest in chests) if chests else "unknown chest", "decoded")
+        return section
+
+    def _insert_weapon_table_properties(self, parent: str, weapon_index: int, *, title: str = "Weapon") -> str:
+        section = self._insert_property(parent, title, self._weapon_name(weapon_index), "weapon table", open=True)
+        info = self.loaded.weapon_table.get(weapon_index) if self.loaded is not None and self.loaded.weapon_table is not None else None
+        if info is None:
+            self._insert_property(section, "Status", "weapon table record unavailable", "weapon table")
+            return section
+        self._insert_property(section, "Value", info.value, "weapon table")
+        self._insert_property(section, "Power", f"{info.base_power}/{info.current_power}", "weapon table")
+        self._insert_property(section, "Remove on wall/enemy", f"{info.remove_on_wall_hit}/{info.remove_on_enemy_hit}", "weapon table")
+        return section
+
     def _event_cells_text(self, event_index: int, *, limit: int = 8) -> str:
         if self.loaded is None or self.loaded.logic_graph is None:
             return "effect-only"
@@ -1898,13 +1844,13 @@ class LevelViewer(ttk.Frame):
         effect_type = puzzle.effect_function_index
         param = puzzle.effect_param
         if effect_type == 0:
-            target = self._insert_property(effect, "Object", self._object_name(param), "object table", open=True)
+            target = self._insert_object_table_properties(effect, param)
             self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
         elif effect_type == 1:
-            target = self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table", open=True)
+            target = self._insert_weapon_table_properties(effect, param)
             self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
         elif effect_type in (2, 9):
-            target = self._insert_property(effect, "Door", f"{puzzle.pixel_x},{puzzle.pixel_y} 32x48", "map", open=True)
+            target = self._insert_property(effect, "Door", f"DOOR{puzzle.index}", "decoded", open=True)
             self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
             self._insert_property(target, "Size", "32x48", "map")
         elif effect_type == 5:
@@ -2145,6 +2091,36 @@ class LevelViewer(ttk.Frame):
                 self._insert_property(actions, f"A{index}", record.action_description(index), "PALFILS")
             return
 
+        if point.kind == "spawned_object":
+            section = self._insert_property_section(f"Spawned object {point.label}", "map puzzle")
+            self._insert_object_table_properties(section, point.index)
+            self._insert_property(section, "Spawn position", f"{point.pixel_x},{point.pixel_y}", "map")
+            return
+
+        if point.kind == "spawned_weapon":
+            section = self._insert_property_section(f"Spawned weapon {point.label}", "map puzzle")
+            self._insert_weapon_table_properties(section, point.index)
+            self._insert_property(section, "Spawn position", f"{point.pixel_x},{point.pixel_y}", "map")
+            return
+
+        if point.kind == "destructable_object" and 0 <= point.index < len(self.loaded.map_data.items):
+            item = self.loaded.map_data.items[point.index]
+            section = self._insert_property_section(f"Destructible target {point.label}", "map item")
+            self._insert_property(section, "Map item", f"I{item.index}", "map")
+            self._insert_property(section, "Position", f"{item.pixel_x},{item.pixel_y}", "map")
+            if item.is_object:
+                self._insert_object_table_properties(section, item.object_or_weapon_info_index)
+            return
+
+        if point.kind == "spawned_destructable_object" and 0 <= point.index < len(self.loaded.map_data.puzzles):
+            puzzle = self.loaded.map_data.puzzles[point.index]
+            section = self._insert_property_section(f"Spawned destructible target {point.label}", "map puzzle")
+            self._insert_property(section, "Source puzzle", f"P{puzzle.index}", "map")
+            self._insert_property(section, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            if puzzle.effect_function_index == 0:
+                self._insert_object_table_properties(section, puzzle.effect_param)
+            return
+
         if point.kind == "hardcoded_teleport_destination":
             for record in special_teleport_destinations(self.loaded.resource.level):
                 if record.index != point.index:
@@ -2174,29 +2150,53 @@ class LevelViewer(ttk.Frame):
             self._insert_property(section, "Position", f"{record.pixel_x},{record.pixel_y}", "PC table")
             self._insert_property(section, "Source", record.source_note, "PC table")
 
+    @staticmethod
+    def _table_item_label(prefix: str, index: int, info, *, style: str) -> str:
+        base = f"{prefix}{index}"
+        if info is None:
+            return base
+        if style == "name":
+            return f"{base}: {info.full_name}"
+        return f"{base} ({info.full_name})"
+
     def _object_name(self, object_index: int) -> str:
-        if self.loaded is None or self.loaded.object_table is None:
-            return f"OBJ{object_index}"
-        info = self.loaded.object_table.get(object_index)
-        return f"OBJ{object_index}: {info.full_name}" if info is not None else f"OBJ{object_index}"
+        info = self.loaded.object_table.get(object_index) if self.loaded is not None and self.loaded.object_table is not None else None
+        return self._table_item_label("OBJ", object_index, info, style="name")
 
     def _object_ref(self, object_index: int) -> str:
-        if self.loaded is None or self.loaded.object_table is None:
-            return f"OBJ{object_index}"
-        info = self.loaded.object_table.get(object_index)
-        return f"OBJ{object_index} ({info.full_name})" if info is not None else f"OBJ{object_index}"
+        info = self.loaded.object_table.get(object_index) if self.loaded is not None and self.loaded.object_table is not None else None
+        return self._table_item_label("OBJ", object_index, info, style="ref")
 
     def _weapon_name(self, weapon_index: int) -> str:
-        if self.loaded is None or self.loaded.weapon_table is None:
-            return f"WPN{weapon_index}"
-        info = self.loaded.weapon_table.get(weapon_index)
-        return f"WPN{weapon_index}: {info.full_name}" if info is not None else f"WPN{weapon_index}"
+        info = self.loaded.weapon_table.get(weapon_index) if self.loaded is not None and self.loaded.weapon_table is not None else None
+        return self._table_item_label("WPN", weapon_index, info, style="name")
 
     def _weapon_ref(self, weapon_index: int) -> str:
-        if self.loaded is None or self.loaded.weapon_table is None:
-            return f"WPN{weapon_index}"
-        info = self.loaded.weapon_table.get(weapon_index)
-        return f"WPN{weapon_index} ({info.full_name})" if info is not None else f"WPN{weapon_index}"
+        info = self.loaded.weapon_table.get(weapon_index) if self.loaded is not None and self.loaded.weapon_table is not None else None
+        return self._table_item_label("WPN", weapon_index, info, style="ref")
+
+    def _logic_target_detail_text(self, point: LogicPoint) -> str:
+        if self.loaded is None:
+            return point.kind.replace("_", " ")
+        if point.kind == "spawned_object" and point.index is not None:
+            return self._object_name(point.index)
+        if point.kind == "spawned_weapon" and point.index is not None:
+            return self._weapon_name(point.index)
+        if point.kind == "destructable_object" and point.index is not None and 0 <= point.index < len(self.loaded.map_data.items):
+            item = self.loaded.map_data.items[point.index]
+            if item.is_object:
+                return f"I{item.index}: {self._object_name(item.object_or_weapon_info_index)}"
+            return f"I{item.index}: destructible target"
+        if point.kind == "spawned_destructable_object" and point.index is not None and 0 <= point.index < len(self.loaded.map_data.puzzles):
+            puzzle = self.loaded.map_data.puzzles[point.index]
+            if puzzle.effect_function_index == 0:
+                return f"P{puzzle.index}: {self._object_name(puzzle.effect_param)}"
+            return f"P{puzzle.index}: spawned destructible target"
+        if point.kind == "destroy_type4_unresolved" and point.index is not None:
+            return f"P{point.index}: unresolved DestroyType4 target"
+        if point.kind == "destroy_type4_offmap" and point.index is not None:
+            return f"P{point.index}: off-map DestroyType4"
+        return point.kind.replace("_", " ")
 
     def _switch_binding_text(self, switch_index: int) -> str:
         if self.loaded is None or self.loaded.logic_graph is None:
@@ -2213,74 +2213,65 @@ class LevelViewer(ttk.Frame):
             return f"S{switch_index} via {', '.join(sources)}"
         return f"S{switch_index}"
 
-    def _condition_param_rows(self, condition_type: int, param: int) -> list[tuple[str, object, str]]:
+    def _switch_condition_rows(self, switch_index: int) -> tuple[PropertyRow, ...]:
+        if self.loaded is None or self.loaded.alfils_data is None or not (0 <= switch_index < len(self.loaded.alfils_data.switches)):
+            return ()
+        switch = self.loaded.alfils_data.switches[switch_index]
+        return (
+            PropertyRow("Object", self._object_name(switch.object_info_index), "object table"),
+            PropertyRow("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
+        )
+
+    def _condition_param_presentation(self, condition_type: int, param: int) -> ConditionParamPresentation:
         if condition_type == 0:
-            return []
+            return ConditionParamPresentation("")
         if condition_type in (1, 2):
-            return [("Object", self._object_ref(param), "object table")]
+            value = self._object_ref(param)
+            return ConditionParamPresentation(value, (PropertyRow("Object", value, "object table"),))
         if condition_type in (3, 4):
-            return [("Weapon", self._weapon_ref(param), "weapon table")]
+            value = self._weapon_ref(param)
+            return ConditionParamPresentation(value, (PropertyRow("Weapon", value, "weapon table"),))
         if condition_type in (5, 6):
             event_index = param - 1
-            return [
-                ("Event", self._event_trigger_text(event_index), "PALFILS"),
-                ("Trigger cells", self._event_cells_text(event_index), "map"),
-            ]
-        if condition_type == 7:
-            return [("Health threshold", f"{param}/24", "decoded")]
-        if condition_type == 8:
-            return [("Health threshold", f"{param}/24", "decoded")]
-        if condition_type == 9:
-            return [("Time threshold", f"{param * 5}s", "decoded")]
-        if condition_type == 10:
-            return [("Time threshold", f"{param * 5}s", "decoded")]
-        if condition_type == 11:
-            rows: list[tuple[str, object, str]] = [("Switch", self._switch_binding_text(param), "PALFILS")]
-            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
-                switch = self.loaded.alfils_data.switches[param]
-                rows.extend(
-                    [
-                        ("Object", self._object_name(switch.object_info_index), "object table"),
-                        ("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
-                    ]
-                )
-            return rows
-        if condition_type == 12:
-            rows = [("Switch", self._switch_binding_text(param), "PALFILS")]
-            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
-                switch = self.loaded.alfils_data.switches[param]
-                rows.extend(
-                    [
-                        ("Object", self._object_name(switch.object_info_index), "object table"),
-                        ("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
-                    ]
-                )
-            return rows
-        if condition_type == 13:
-            return [("Score threshold", param * 5000, "decoded")]
-        if condition_type == 14:
-            return [("Score threshold", param * 5000, "decoded")]
-        if condition_type == 15:
-            return [("Lives threshold", param, "decoded")]
-        if condition_type == 16:
-            return [("Lives threshold", param, "decoded")]
-        return [("Raw param", param, "map")]
+            value = self._event_trigger_text(event_index)
+            return ConditionParamPresentation(
+                value,
+                (
+                    PropertyRow("Event", value, "PALFILS"),
+                    PropertyRow("Trigger cells", self._event_cells_text(event_index), "map"),
+                ),
+            )
+        if condition_type in (7, 8):
+            value = f"{param}/24"
+            return ConditionParamPresentation(value, (PropertyRow("Health threshold", value, "decoded"),))
+        if condition_type in (9, 10):
+            value = f"{param * 5}s"
+            return ConditionParamPresentation(value, (PropertyRow("Time threshold", value, "decoded"),))
+        if condition_type in (11, 12):
+            value = self._switch_binding_text(param)
+            return ConditionParamPresentation(
+                value,
+                (PropertyRow("Switch", value, "PALFILS"), *self._switch_condition_rows(param)),
+            )
+        if condition_type in (13, 14):
+            value = param * 5000
+            return ConditionParamPresentation(str(value), (PropertyRow("Score threshold", value, "decoded"),))
+        if condition_type in (15, 16):
+            return ConditionParamPresentation(str(param), (PropertyRow("Lives threshold", param, "decoded"),))
+        return ConditionParamPresentation(str(param), (PropertyRow("Raw param", param, "map"),))
 
     def _insert_puzzle_condition_param_fields(self, parent: str, condition_type: int, param: int) -> None:
         if condition_type in (5, 6):
-            event_index = param - 1
-            target = self._insert_property(parent, "Event", self._event_trigger_text(event_index), "PALFILS", open=True)
-            self._insert_property(target, "Trigger cells", self._event_cells_text(event_index), "map")
+            presentation = self._condition_param_presentation(condition_type, param)
+            target = self._insert_property(parent, "Event", presentation.rows[0].value, presentation.rows[0].source, open=True)
+            self._insert_property_rows(target, presentation.rows[1:])
             return
         if condition_type in (11, 12):
-            target = self._insert_property(parent, "Switch", self._switch_binding_text(param), "PALFILS", open=True)
-            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
-                switch = self.loaded.alfils_data.switches[param]
-                self._insert_property(target, "Object", self._object_name(switch.object_info_index), "object table")
-                self._insert_property(target, "Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS")
+            presentation = self._condition_param_presentation(condition_type, param)
+            target = self._insert_property(parent, "Switch", presentation.rows[0].value, presentation.rows[0].source, open=True)
+            self._insert_property_rows(target, presentation.rows[1:])
             return
-        for field, value, source in self._condition_param_rows(condition_type, param):
-            self._insert_property(parent, field, value, source)
+        self._insert_property_rows(parent, self._condition_param_presentation(condition_type, param).rows)
 
     def _event_action_text(self, event) -> str:
         target = self._wave_target_for_event(event)
@@ -2309,8 +2300,7 @@ class LevelViewer(ttk.Frame):
 
     def _condition_text(self, condition_type: int, param: int) -> str:
         name = condition_type_name(condition_type)
-        param_rows = self._condition_param_rows(condition_type, param)
-        param_text = str(param_rows[0][1]) if param_rows else str(param)
+        param_text = self._condition_param_presentation(condition_type, param).summary
         if condition_type == 0:
             return "always true"
         if condition_type in (1, 2):
@@ -2352,7 +2342,7 @@ class LevelViewer(ttk.Frame):
         if effect == 1:
             return f"spawn {self._weapon_ref(param)}"
         if effect in (2, 9):
-            return f"{name} at ({puzzle.pixel_x},{puzzle.pixel_y})"
+            return f"{name} DOOR{puzzle.index}"
         if effect == 5:
             return f"trigger {self._event_trigger_text(param - 1)}"
         if effect == 6:
@@ -2419,9 +2409,58 @@ class LevelViewer(ttk.Frame):
         if path is None:
             self._insert_property(root, "Status", "path unavailable", ".PAT")
             return
+        if getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+            self._set_flying_path_preview(path)
         self._insert_property(root, "Type", path.kind, ".PAT")
         self._insert_property(root, "Nodes", len(path.deltas), ".PAT")
         self._insert_property(root, "Base", f"{path.base_x},{path.base_y}", ".PAT")
+
+    def _set_flying_path_preview(self, path) -> None:
+        if not hasattr(self, "path_preview_canvas"):
+            return
+        canvas = self.path_preview_canvas
+        canvas.delete("all")
+        if path is None:
+            canvas.pack_forget()
+            return
+        if not canvas.winfo_ismapped():
+            canvas.pack(fill=tk.X, pady=(0, 4), before=self.browser_property_tree)
+        canvas.update_idletasks()
+        width = max(canvas.winfo_width(), 220)
+        height = max(canvas.winfo_height(), 90)
+        points = path.points_for_event_center(0, 0)
+        if not points:
+            canvas.create_text(10, height // 2, text="empty path", fill="#d8d8d8", anchor="w")
+            return
+        min_x = min(x for x, _y in points)
+        max_x = max(x for x, _y in points)
+        min_y = min(y for _x, y in points)
+        max_y = max(y for _x, y in points)
+        span_x = max(1, max_x - min_x)
+        span_y = max(1, max_y - min_y)
+        margin = 14
+        scale = min((width - margin * 2) / span_x, (height - margin * 2) / span_y, 4.0)
+        if scale <= 0:
+            scale = 1.0
+
+        def project(point: tuple[int, int]) -> tuple[float, float]:
+            x, y = point
+            px = margin + (x - min_x) * scale
+            py = margin + (y - min_y) * scale
+            return px, py
+
+        projected = [project(point) for point in points]
+        color = "#50ffb4" if path.is_absolute else "#ffb450"
+        canvas.create_rectangle(1, 1, width - 2, height - 2, outline="#606060")
+        if len(projected) >= 2:
+            flat = [coord for point in projected for coord in point]
+            canvas.create_line(*flat, fill="#000000", width=4, smooth=False)
+            canvas.create_line(*flat, fill=color, width=2, smooth=False)
+        first_x, first_y = projected[0]
+        last_x, last_y = projected[-1]
+        canvas.create_oval(first_x - 4, first_y - 4, first_x + 4, first_y + 4, outline=color, width=2)
+        canvas.create_rectangle(last_x - 3, last_y - 3, last_x + 3, last_y + 3, outline=color, width=2)
+        canvas.create_text(8, 8, text=f"FP{path.index} {path.kind}", fill="#d8d8d8", anchor="nw")
 
     def _populate_entity_tree(self) -> None:
         if not hasattr(self, "entity_group_stack"):
@@ -2717,7 +2756,7 @@ class LevelViewer(ttk.Frame):
 
         if group == "Physical logic targets" or group.startswith("Logic targets:") or group.startswith("Logic:"):
             point = payload
-            detail = point.kind.replace("_", " ")
+            detail = self._logic_target_detail_text(point)
             position = "off-map" if point.kind == "destroy_type4_offmap" else self._position_text(point.pixel_x, point.pixel_y)
             return detail, position, "point", point
 

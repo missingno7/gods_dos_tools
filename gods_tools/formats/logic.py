@@ -297,12 +297,7 @@ def _puzzle_effect_points(graph: "LogicGraph", puzzle: MapPuzzle) -> tuple[tuple
     x, y = puzzle.pixel_x, puzzle.pixel_y
 
     if effect_type == 0:  # SpawnObject
-        label = f"SPO{effect_param}"
-        if graph.object_table is not None:
-            info = graph.object_table.get(effect_param)
-            if info is not None and info.full_name != "—":
-                label = f"SPO{effect_param}"
-        return ((LogicPoint(x, y, label, "spawned_object", effect_param), "spawns object"),)
+        return ((LogicPoint(x, y, f"SPO{effect_param}", "spawned_object", effect_param), "spawns object"),)
     if effect_type == 1:  # SpawnWeapon
         return ((LogicPoint(x, y, f"WPN{effect_param}", "spawned_weapon", effect_param), "spawns weapon"),)
     if effect_type in (2, 9):  # OpenDoor / CloseDoor; door is 32x48 from puzzle XY.

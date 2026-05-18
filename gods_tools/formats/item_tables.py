@@ -77,6 +77,8 @@ class ObjectInfo:
     def full_name(self) -> str:
         if self.name and self.description:
             return f"{self.name} ({self.description})"
+        if not self.name and not self.description and self.type_index == 3:
+            return "button"
         return self.name or self.description or "—"
 
     @property
