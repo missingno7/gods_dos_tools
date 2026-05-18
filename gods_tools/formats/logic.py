@@ -109,7 +109,7 @@ def _object_source_points(
 
     for puzzle in graph.map_data.active_puzzles:
         if puzzle.effect_function_index == 0 and puzzle.effect_param == object_info_index:
-            points.append(_puzzle_spawn_point(puzzle, f"P{puzzle.index}/OBJ{object_info_index}", "spawned_object_source"))
+            points.append(_puzzle_spawn_point(puzzle, f"P{puzzle.index}/SPO{object_info_index}", "spawned_object_source"))
 
     for wave in graph.alfils_data.active_walking_waves:
         if wave.reward_kind == "object" and wave.reward_info_index == object_info_index:
@@ -276,11 +276,11 @@ def _nearest_destructable_item_point(graph: "LogicGraph", puzzle: MapPuzzle) -> 
     pretty = full_name if full_name != "—" else "type-4 object"
     if source_kind == "map_item":
         return (
-            LogicPoint(target_x, target_y, f"DOBJ{source_index}", "destructable_object", source_index),
+            LogicPoint(target_x, target_y, f"DEO{source_index}", "destructable_object", source_index),
             f"destroys destructable map item I{source_index} ({pretty})",
         )
     return (
-        LogicPoint(target_x, target_y, f"SDOBJ{source_index}", "spawned_destructable_object", source_index),
+        LogicPoint(target_x, target_y, f"SDEO{source_index}", "spawned_destructable_object", source_index),
         f"destroys spawned destructable object from P{source_index} ({pretty})",
     )
 
@@ -297,11 +297,11 @@ def _puzzle_effect_points(graph: "LogicGraph", puzzle: MapPuzzle) -> tuple[tuple
     x, y = puzzle.pixel_x, puzzle.pixel_y
 
     if effect_type == 0:  # SpawnObject
-        label = f"OBJ{effect_param}"
+        label = f"SPO{effect_param}"
         if graph.object_table is not None:
             info = graph.object_table.get(effect_param)
             if info is not None and info.full_name != "—":
-                label = f"OBJ{effect_param}"
+                label = f"SPO{effect_param}"
         return ((LogicPoint(x, y, label, "spawned_object", effect_param), "spawns object"),)
     if effect_type == 1:  # SpawnWeapon
         return ((LogicPoint(x, y, f"WPN{effect_param}", "spawned_weapon", effect_param), "spawns weapon"),)

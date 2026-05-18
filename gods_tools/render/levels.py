@@ -275,7 +275,7 @@ def _hidden_spawned_item_entries(
         label = ""
         if puzzle.effect_function_index == 0:  # SpawnObject
             sprite = sprite_bank.object_sprite(puzzle.effect_param)
-            label = f"P{puzzle.index}->OBJ{puzzle.effect_param}"
+            label = f"P{puzzle.index}->SPO{puzzle.effect_param}"
         elif puzzle.effect_function_index == 1:  # SpawnWeapon
             sprite = sprite_bank.weapon_sprite(puzzle.effect_param)
             label = f"P{puzzle.index}->WPN{puzzle.effect_param}"

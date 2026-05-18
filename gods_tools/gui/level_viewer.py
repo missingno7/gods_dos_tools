@@ -118,6 +118,8 @@ class LevelViewer(ttk.Frame):
         self.inspect_var = tk.StringVar(value="Click the rendered map to inspect tile coordinates and layer values.")
         self.hover_var = tk.StringVar(value="Hover an entity in the map to preview what would be selected.")
         self.entity_refs: dict[str, tuple[str, object]] = {}
+        self.context_refs: dict[str, tuple[str, object]] = {}
+        self.entity_rows_by_ref: dict[tuple[str, object], tuple[str, str, str, str]] = {}
         self.entity_trees: dict[str, ttk.Treeview] = {}
         self.entity_group_frames: dict[str, ttk.Frame] = {}
         self.entity_group_buttons: dict[str, ttk.Button] = {}
@@ -184,10 +186,12 @@ class LevelViewer(ttk.Frame):
         self.left_tabs.pack(fill=tk.BOTH, expand=True)
 
         browse_tab = ttk.Frame(self.left_tabs, padding=8)
+        context_tab = ttk.Frame(self.left_tabs, padding=8)
         puzzle_tab = ttk.Frame(self.left_tabs, padding=8)
         overlays_tab = ttk.Frame(self.left_tabs, padding=8)
         status_tab = ttk.Frame(self.left_tabs, padding=8)
         self.left_tabs.add(browse_tab, text="Browse")
+        self.left_tabs.add(context_tab, text="Context")
         self.left_tabs.add(overlays_tab, text="Overlays")
         self.left_tabs.add(status_tab, text="Status")
 
@@ -223,6 +227,52 @@ class LevelViewer(ttk.Frame):
         self.property_tree.configure(yscrollcommand=prop_scroll.set)
         self.property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(context_tab, text="Selection context", font=("", 11, "bold")).pack(anchor="w", pady=(0, 4))
+        context_pane = ttk.PanedWindow(context_tab, orient=tk.VERTICAL)
+        context_pane.pack(fill=tk.BOTH, expand=True)
+
+        context_frame = ttk.Frame(context_pane)
+        context_pane.add(context_frame, weight=3)
+        self.context_tree = ttk.Treeview(
+            context_frame,
+            columns=("group", "detail", "pos"),
+            show="tree headings",
+            height=16,
+            selectmode="browse",
+        )
+        self.context_tree.heading("#0", text="Entity")
+        self.context_tree.heading("group", text="Group")
+        self.context_tree.heading("detail", text="Meaning")
+        self.context_tree.heading("pos", text="Pos")
+        self.context_tree.column("#0", width=76, stretch=False)
+        self.context_tree.column("group", width=92, stretch=False)
+        self.context_tree.column("detail", width=190, stretch=True)
+        self.context_tree.column("pos", width=66, stretch=False)
+        context_scroll = ttk.Scrollbar(context_frame, orient=tk.VERTICAL, command=self.context_tree.yview)
+        self.context_tree.configure(yscrollcommand=context_scroll.set)
+        self.context_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        context_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.context_tree.bind("<<TreeviewSelect>>", self._on_context_selected)
+        self.context_tree.bind("<Double-Button-1>", self._on_context_activated)
+
+        context_prop_frame = ttk.LabelFrame(context_pane, text="Properties", padding=4)
+        context_pane.add(context_prop_frame, weight=1)
+        self.context_property_tree = ttk.Treeview(
+            context_prop_frame,
+            columns=("value",),
+            show="tree headings",
+            height=7,
+            selectmode="browse",
+        )
+        self.context_property_tree.heading("#0", text="Field")
+        self.context_property_tree.heading("value", text="Value")
+        self.context_property_tree.column("#0", width=130, stretch=False)
+        self.context_property_tree.column("value", width=220, stretch=True)
+        context_prop_scroll = ttk.Scrollbar(context_prop_frame, orient=tk.VERTICAL, command=self.context_property_tree.yview)
+        self.context_property_tree.configure(yscrollcommand=context_prop_scroll.set)
+        self.context_property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        context_prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         ttk.Label(puzzle_tab, text="Puzzle objects", font=("", 11, "bold")).pack(anchor="w", pady=(0, 4))
         puzzle_frame = ttk.Frame(puzzle_tab)
@@ -1518,7 +1568,8 @@ class LevelViewer(ttk.Frame):
         tree.configure(yscrollcommand=scroll.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        tree.bind("<<TreeviewSelect>>", self._on_entity_selected)
+        tree.bind("<<TreeviewSelect>>", self._on_browser_entity_selected)
+        tree.bind("<Double-Button-1>", self._on_entity_selected)
         self.entity_group_frames[label] = frame
         self.entity_group_buttons[label] = button
         self.entity_trees[label] = tree
@@ -1564,7 +1615,10 @@ class LevelViewer(ttk.Frame):
             return
         iid = f"entity:{len(self.entity_refs)}"
         tree.insert("", tk.END, iid=iid, text=label, values=(detail, position))
-        self.entity_refs[iid] = (ref_kind, ref_value)
+        ref = (ref_kind, ref_value)
+        self.entity_refs[iid] = ref
+        group = next((name for name, candidate in self.entity_trees.items() if candidate is tree), "")
+        self.entity_rows_by_ref.setdefault(ref, (label, group, detail, position))
 
     @staticmethod
     def _position_text(x: int | None, y: int | None) -> str:
@@ -1734,6 +1788,58 @@ class LevelViewer(ttk.Frame):
         else:
             self.property_tree.insert("", tk.END, text="Selection", values=("None",))
 
+    def _selection_snapshot(self) -> tuple[int | None, int | None, LogicPoint | None, EnemySelection | None, MapItemSelection | None]:
+        return (
+            self.selected_event_index,
+            self.selected_flying_path_index,
+            self.selected_logic_point,
+            self.selected_enemy_wave,
+            self.selected_map_item,
+        )
+
+    def _restore_selection_snapshot(self, snapshot: tuple[int | None, int | None, LogicPoint | None, EnemySelection | None, MapItemSelection | None]) -> None:
+        (
+            self.selected_event_index,
+            self.selected_flying_path_index,
+            self.selected_logic_point,
+            self.selected_enemy_wave,
+            self.selected_map_item,
+        ) = snapshot
+
+    def _set_selection_from_ref_for_properties(self, ref: tuple[str, object]) -> None:
+        ref_kind, value = ref
+        self.selected_event_index = None
+        self.selected_flying_path_index = None
+        self.selected_logic_point = None
+        self.selected_enemy_wave = None
+        self.selected_map_item = None
+        if ref_kind == "event":
+            self.selected_event_index = int(value)
+        elif ref_kind == "path":
+            self.selected_flying_path_index = int(value)
+        elif ref_kind == "wave":
+            assert isinstance(value, EnemySelection)
+            self.selected_enemy_wave = value
+        elif ref_kind == "item":
+            assert isinstance(value, MapItemSelection)
+            self.selected_map_item = value
+        else:
+            assert isinstance(value, LogicPoint)
+            self.selected_logic_point = value
+
+    def _populate_properties_tree_for_ref(self, tree: ttk.Treeview, ref: tuple[str, object]) -> None:
+        if self.loaded is None:
+            return
+        snapshot = self._selection_snapshot()
+        original_tree = self.property_tree
+        try:
+            self.property_tree = tree
+            self._set_selection_from_ref_for_properties(ref)
+            self._update_entity_properties()
+        finally:
+            self.property_tree = original_tree
+            self._restore_selection_snapshot(snapshot)
+
     def _insert_property_section(self, title: str, source: str, *, open: bool = True) -> str:
         return self.property_tree.insert("", tk.END, text=title, values=("",), open=open)
 
@@ -1792,22 +1898,26 @@ class LevelViewer(ttk.Frame):
         effect_type = puzzle.effect_function_index
         param = puzzle.effect_param
         if effect_type == 0:
-            self._insert_property(effect, "Object", self._object_name(param), "object table")
-            self._insert_property(effect, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            target = self._insert_property(effect, "Object", self._object_name(param), "object table", open=True)
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
         elif effect_type == 1:
-            self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table")
-            self._insert_property(effect, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            target = self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table", open=True)
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
         elif effect_type in (2, 9):
-            self._insert_property(effect, "Door rectangle", f"{puzzle.pixel_x},{puzzle.pixel_y} 32x48", "map")
+            target = self._insert_property(effect, "Door", f"{puzzle.pixel_x},{puzzle.pixel_y} 32x48", "map", open=True)
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(target, "Size", "32x48", "map")
         elif effect_type == 5:
-            self._insert_property(effect, "Event", self._event_trigger_text(param - 1), "PALFILS")
+            target = self._insert_property(effect, "Event", self._event_trigger_text(param - 1), "PALFILS", open=True)
+            self._insert_property(target, "Trigger cells", self._event_cells_text(param - 1), "map")
         elif effect_type == 6:
-            self._insert_property(effect, "Search origin", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            target = self._insert_property(effect, "Target", "type-4 destructible", "decoded", open=True)
+            self._insert_property(target, "Search origin", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
         elif effect_type in (7, 8):
-            self._insert_property(effect, "Trapdoor", f"D{param}", "PALFILS")
+            target = self._insert_property(effect, "Trapdoor", f"D{param}", "PALFILS", open=True)
             if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.trapdoors):
                 trapdoor = self.loaded.alfils_data.trapdoors[param]
-                self._insert_property(effect, "Trapdoor position", f"{trapdoor.pixel_x},{trapdoor.pixel_y}", "PALFILS")
+                self._insert_property(target, "Position", f"{trapdoor.pixel_x},{trapdoor.pixel_y}", "PALFILS")
         elif effect_type == 10:
             self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table")
 
@@ -1821,15 +1931,8 @@ class LevelViewer(ttk.Frame):
                 "decoded",
                 open=True,
             )
-            self._insert_property(condition_parent, "Raw type", f"{condition_type}: {condition_type_name(condition_type)}", "map")
-            self._insert_property(condition_parent, "Raw param", param, "map")
-            if condition_type in (11, 12) and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
-                switch = self.loaded.alfils_data.switches[param]
-                self._insert_property(condition_parent, "Switch record", f"S{switch.index}: {self._object_name(switch.object_info_index)}", "PALFILS")
-                self._insert_property(condition_parent, "Switch position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS")
-            if condition_type in (5, 6):
-                event_index = param - 1
-                self._insert_property(condition_parent, "Event trigger cells", self._event_cells_text(event_index), "map")
+            self._insert_property(condition_parent, "Type", f"{condition_type}: {condition_type_name(condition_type)}", "map")
+            self._insert_puzzle_condition_param_fields(condition_parent, condition_type, param)
 
     def _insert_event_effect_tree(self, parent: str, event) -> None:
         effect = self._insert_property(parent, "Effect", event.type_name, "PALFILS", open=True)
@@ -2110,6 +2213,75 @@ class LevelViewer(ttk.Frame):
             return f"S{switch_index} via {', '.join(sources)}"
         return f"S{switch_index}"
 
+    def _condition_param_rows(self, condition_type: int, param: int) -> list[tuple[str, object, str]]:
+        if condition_type == 0:
+            return []
+        if condition_type in (1, 2):
+            return [("Object", self._object_ref(param), "object table")]
+        if condition_type in (3, 4):
+            return [("Weapon", self._weapon_ref(param), "weapon table")]
+        if condition_type in (5, 6):
+            event_index = param - 1
+            return [
+                ("Event", self._event_trigger_text(event_index), "PALFILS"),
+                ("Trigger cells", self._event_cells_text(event_index), "map"),
+            ]
+        if condition_type == 7:
+            return [("Health threshold", f"{param}/24", "decoded")]
+        if condition_type == 8:
+            return [("Health threshold", f"{param}/24", "decoded")]
+        if condition_type == 9:
+            return [("Time threshold", f"{param * 5}s", "decoded")]
+        if condition_type == 10:
+            return [("Time threshold", f"{param * 5}s", "decoded")]
+        if condition_type == 11:
+            rows: list[tuple[str, object, str]] = [("Switch", self._switch_binding_text(param), "PALFILS")]
+            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
+                switch = self.loaded.alfils_data.switches[param]
+                rows.extend(
+                    [
+                        ("Object", self._object_name(switch.object_info_index), "object table"),
+                        ("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
+                    ]
+                )
+            return rows
+        if condition_type == 12:
+            rows = [("Switch", self._switch_binding_text(param), "PALFILS")]
+            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
+                switch = self.loaded.alfils_data.switches[param]
+                rows.extend(
+                    [
+                        ("Object", self._object_name(switch.object_info_index), "object table"),
+                        ("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
+                    ]
+                )
+            return rows
+        if condition_type == 13:
+            return [("Score threshold", param * 5000, "decoded")]
+        if condition_type == 14:
+            return [("Score threshold", param * 5000, "decoded")]
+        if condition_type == 15:
+            return [("Lives threshold", param, "decoded")]
+        if condition_type == 16:
+            return [("Lives threshold", param, "decoded")]
+        return [("Raw param", param, "map")]
+
+    def _insert_puzzle_condition_param_fields(self, parent: str, condition_type: int, param: int) -> None:
+        if condition_type in (5, 6):
+            event_index = param - 1
+            target = self._insert_property(parent, "Event", self._event_trigger_text(event_index), "PALFILS", open=True)
+            self._insert_property(target, "Trigger cells", self._event_cells_text(event_index), "map")
+            return
+        if condition_type in (11, 12):
+            target = self._insert_property(parent, "Switch", self._switch_binding_text(param), "PALFILS", open=True)
+            if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.switches):
+                switch = self.loaded.alfils_data.switches[param]
+                self._insert_property(target, "Object", self._object_name(switch.object_info_index), "object table")
+                self._insert_property(target, "Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS")
+            return
+        for field, value, source in self._condition_param_rows(condition_type, param):
+            self._insert_property(parent, field, value, source)
+
     def _event_action_text(self, event) -> str:
         target = self._wave_target_for_event(event)
         if target is not None:
@@ -2137,37 +2309,38 @@ class LevelViewer(ttk.Frame):
 
     def _condition_text(self, condition_type: int, param: int) -> str:
         name = condition_type_name(condition_type)
+        param_rows = self._condition_param_rows(condition_type, param)
+        param_text = str(param_rows[0][1]) if param_rows else str(param)
         if condition_type == 0:
             return "always true"
         if condition_type in (1, 2):
             verb = "player carries" if condition_type == 1 else "player does not carry"
-            return f"{verb} {self._object_ref(param)}"
+            return f"{verb} {param_text}"
         if condition_type in (3, 4):
             verb = "player holds" if condition_type == 3 else "player does not hold"
-            return f"{verb} {self._weapon_ref(param)}"
+            return f"{verb} {param_text}"
         if condition_type in (5, 6):
-            event_index = param - 1
             verb = "event has fired" if condition_type == 5 else "event has not fired"
-            return f"{verb}: {self._event_trigger_text(event_index)}"
+            return f"{verb}: {param_text}"
         if condition_type in (11, 12):
             verb = "switch ON" if condition_type == 11 else "switch OFF"
-            return f"{verb}: {self._switch_binding_text(param)}"
+            return f"{verb}: {param_text}"
         if condition_type == 7:
-            return f"health > {param}/24"
+            return f"health > {param_text}"
         if condition_type == 8:
-            return f"health < {param}/24"
+            return f"health < {param_text}"
         if condition_type == 9:
-            return f"time > {param * 5}s"
+            return f"time > {param_text}"
         if condition_type == 10:
-            return f"time < {param * 5}s"
+            return f"time < {param_text}"
         if condition_type == 13:
-            return f"score > {param * 5000}"
+            return f"score > {param_text}"
         if condition_type == 14:
-            return f"score < {param * 5000}"
+            return f"score < {param_text}"
         if condition_type == 15:
-            return f"lives > {param}"
+            return f"lives > {param_text}"
         if condition_type == 16:
-            return f"lives < {param}"
+            return f"lives < {param_text}"
         return f"{name}({param})"
 
     def _effect_text(self, puzzle) -> str:
@@ -2261,6 +2434,10 @@ class LevelViewer(ttk.Frame):
         self.entity_group_buttons.clear()
         self.entity_trees.clear()
         self.entity_refs.clear()
+        self.context_refs.clear()
+        self.entity_rows_by_ref.clear()
+        if hasattr(self, "context_tree"):
+            self.context_tree.delete(*self.context_tree.get_children())
         self.selected_entity_group = None
         if self.loaded is None:
             return
@@ -2689,6 +2866,58 @@ class LevelViewer(ttk.Frame):
                 if tree.exists(item_id):
                     tree.item(item_id, tags=tags)
                     break
+        self._update_context_tree(related)
+
+    def _update_context_tree(self, related: set[tuple[str, object]] | None = None) -> None:
+        if not hasattr(self, "context_tree"):
+            return
+        related = self._related_entity_refs_for_selection() if related is None else related
+        self.context_tree.delete(*self.context_tree.get_children())
+        self.context_refs.clear()
+        if hasattr(self, "context_property_tree"):
+            self.context_property_tree.delete(*self.context_property_tree.get_children())
+        if not related:
+            self.context_tree.insert("", tk.END, text="No selection", values=("", "Select an entity to see nearby context", ""))
+            if hasattr(self, "context_property_tree"):
+                self.context_property_tree.insert("", tk.END, text="Selection", values=("None",))
+            return
+
+        ordered_refs = [ref for ref in self.entity_rows_by_ref if ref in related]
+        for ref in ordered_refs:
+            label, group, detail, position = self.entity_rows_by_ref[ref]
+            iid = f"context:{len(self.context_refs)}"
+            self.context_tree.insert("", tk.END, iid=iid, text=label, values=(group, detail, position))
+            self.context_refs[iid] = ref
+
+    def _on_context_selected(self, _event: tk.Event) -> None:
+        if not hasattr(self, "context_property_tree"):
+            return
+        selection = self.context_tree.selection()
+        if not selection:
+            return
+        ref = self.context_refs.get(selection[0])
+        if ref is None:
+            self.context_property_tree.delete(*self.context_property_tree.get_children())
+            self.context_property_tree.insert("", tk.END, text="Selection", values=("None",))
+            return
+        self._populate_properties_tree_for_ref(self.context_property_tree, ref)
+
+    def _on_context_activated(self, event: tk.Event) -> None:
+        self._on_entity_selected(event)
+
+    def _on_browser_entity_selected(self, event: tk.Event) -> None:
+        tree = event.widget
+        if not isinstance(tree, ttk.Treeview):
+            return
+        selection = tree.selection()
+        if not selection:
+            return
+        ref = self.entity_refs.get(selection[0])
+        if ref is None:
+            self.property_tree.delete(*self.property_tree.get_children())
+            self.property_tree.insert("", tk.END, text="Selection", values=("None",))
+            return
+        self._populate_properties_tree_for_ref(self.property_tree, ref)
 
     def _on_entity_selected(self, _event: tk.Event) -> None:
         tree = _event.widget
@@ -2697,7 +2926,7 @@ class LevelViewer(ttk.Frame):
         selection = tree.selection()
         if not selection or self.loaded is None:
             return
-        ref = self.entity_refs.get(selection[0])
+        ref = self.entity_refs.get(selection[0]) or self.context_refs.get(selection[0])
         if ref is None:
             return
         ref_kind, value = ref
