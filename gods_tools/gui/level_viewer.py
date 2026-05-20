@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
 from gods_tools.formats.compression import GodsCompressionError, dcl_pack
@@ -38,6 +38,45 @@ from gods_tools.model.document import LevelDocument
 from gods_tools.model.entities import EntityIndex, IndexedEntity, build_entity_index
 from gods_tools.edit.session import EditSession
 from .image_canvas import ImageCanvas
+
+
+WALKING_WAVE_FUNCTION_NAMES: dict[int, str] = {
+    0: "Default walking AI",
+    1: "Walking AI variant 1",
+    2: "Walking AI variant 2",
+    3: "Walking AI variant 3",
+    4: "Walking AI variant 4",
+    5: "Walking AI variant 5",
+    6: "Walking AI variant 6",
+    7: "Walking AI variant 7",
+    8: "Walking AI variant 8",
+    9: "Walking AI variant 9",
+    10: "Walking AI variant 10",
+    11: "Walking AI variant 11",
+    12: "Walking AI variant 12",
+    13: "Walking AI variant 13",
+    14: "Walking AI variant 14",
+    15: "Walking AI variant 15",
+}
+
+WALKING_WAVE_MISSILE_TYPE_NAMES: dict[int, str] = {
+    0: "No missile / contact only",
+    1: "Missile pattern 1",
+    2: "Missile pattern 2",
+    3: "Missile pattern 3",
+    4: "Missile pattern 4",
+    5: "Missile pattern 5",
+    6: "Missile pattern 6",
+    7: "Missile pattern 7",
+    8: "Missile pattern 8",
+    9: "Missile pattern 9",
+    10: "Missile pattern 10",
+    11: "Missile pattern 11",
+    12: "Missile pattern 12",
+    13: "Missile pattern 13",
+    14: "Missile pattern 14",
+    15: "Missile pattern 15",
+}
 
 
 @dataclass(frozen=True)
@@ -150,6 +189,7 @@ class LevelViewer(ttk.Frame):
         self.entity_refs: dict[str, tuple[str, object]] = {}
         self.context_refs: dict[str, tuple[str, object]] = {}
         self.entity_rows_by_ref: dict[tuple[str, object], tuple[str, str, str, str]] = {}
+        self.browser_selected_ref: tuple[str, object] | None = None
         self.edit_ref: tuple[str, object] | None = None
         self.edit_vars: dict[str, tk.StringVar] = {}
         self.property_edit_specs: dict[str, PropertyEditSpec] = {}
@@ -164,6 +204,9 @@ class LevelViewer(ttk.Frame):
         self.selected_entity_group: str | None = None
         self.puzzle_refs: dict[str, tuple[str, object]] = {}
         self._auto_enabled_flying_paths = False
+        self._inline_cell_editor: tk.Widget | None = None
+        self._inline_cell_editor_item: str | None = None
+        self._inline_atlas_images: list[ImageTk.PhotoImage] = []
 
         self.show_raster_var = tk.BooleanVar(value=False)
         self.show_collision_var = tk.BooleanVar(value=False)
@@ -210,7 +253,7 @@ class LevelViewer(ttk.Frame):
         )
         self.level_combo.pack(side=tk.LEFT, padx=(0, 12))
         self.level_combo.bind("<<ComboboxSelected>>", self._on_level_combo_selected)
-        ttk.Label(top_bar, text="Double-click entity in map → reveal in Entity Browser", foreground="#666666").pack(side=tk.LEFT)
+        ttk.Label(top_bar, text="Click entity → edit properties; double-click → reveal/highlight on map", foreground="#666666").pack(side=tk.LEFT)
 
         outer = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -259,13 +302,25 @@ class LevelViewer(ttk.Frame):
         self.path_preview_canvas = tk.Canvas(property_frame, height=110, background="#181818", highlightthickness=1, highlightbackground="#606060")
         self.path_preview_canvas.pack(fill=tk.X, pady=(0, 4))
         self.path_preview_canvas.pack_forget()
+        # Keep the property table and its scrollbar in their own horizontal shell.
+        # IMPORTANT: the Treeview must be parented by this shell.  Using ``pack(in_=...)``
+        # with a Treeview whose real parent is ``property_frame`` is fragile in Tk and can
+        # leave the tree unmapped/blank while the scrollbar remains visible.
+        # The inline atlas sits below this shell and owns a separate scrollbar.
+        property_tree_shell = ttk.Frame(property_frame)
+        property_tree_shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.property_tree = ttk.Treeview(
-            property_frame,
+            property_tree_shell,
             columns=("value",),
             show="tree headings",
             height=7,
             selectmode="browse",
         )
+        prop_scroll = ttk.Scrollbar(property_tree_shell, orient=tk.VERTICAL, command=self.property_tree.yview)
+        self.property_tree.configure(yscrollcommand=prop_scroll.set)
+        self.property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.property_tree.heading("#0", text="Field")
         self.property_tree.heading("value", text="Value")
         self.property_tree.column("#0", width=130, stretch=False)
@@ -274,18 +329,17 @@ class LevelViewer(ttk.Frame):
         self.property_tree.tag_configure("pending_delete", foreground="#b00020")
         self.property_tree.tag_configure("pending_new", foreground="#007a3d")
         self.browser_property_tree = self.property_tree
-        prop_scroll = ttk.Scrollbar(property_frame, orient=tk.VERTICAL, command=self.property_tree.yview)
-        self.property_tree.configure(yscrollcommand=prop_scroll.set)
+
         property_actions = ttk.Frame(property_frame)
         property_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         ttk.Label(property_actions, textvariable=self.pending_edit_count_var).pack(side=tk.LEFT)
         ttk.Button(property_actions, text="Apply", command=self.apply_pending_property_edits).pack(side=tk.RIGHT)
         ttk.Button(property_actions, text="Clear", command=self.clear_pending_property_edits).pack(side=tk.RIGHT, padx=(0, 4))
-        self.property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.property_tree.bind("<ButtonRelease-1>", self._on_property_clicked, add="+")
         self.property_tree.bind("<Double-Button-1>", self._on_property_activated)
         self.property_tree.bind("<Delete>", self._on_property_delete)
-        prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.edit_frame = ttk.LabelFrame(property_frame, text="Edit", padding=4)
+
+        self.edit_frame = ttk.LabelFrame(property_frame, text="Inline picker", padding=4)
         self.edit_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         self.edit_frame.pack_forget()
 
@@ -1776,7 +1830,23 @@ class LevelViewer(ttk.Frame):
     def _update_entity_properties(self) -> None:
         if not hasattr(self, "property_tree"):
             return
+        self._close_inline_property_editor()
         is_browser_properties = getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None)
+
+        # The Browse-tab property grid is an editor for the row selected in the
+        # Entity browser.  That is intentionally separate from the map/context
+        # selection made by double-clicking a row or clicking the rendered map.
+        #
+        # Before this split, any pending-property refresh rebuilt the browser and
+        # then repopulated Properties from selected_event_index/selected_logic_point
+        # first.  Repro: double-click E2 to highlight it on the map, single-click
+        # P6 to edit it, change Time threshold -> the refresh jumped the browser
+        # back to Events/E2.  Keep browser_selected_ref as the canonical source for
+        # inline editing; double-click remains only the highlight/context action.
+        if is_browser_properties and self.browser_selected_ref is not None:
+            self._populate_browser_properties_for_ref(self.browser_selected_ref)
+            return
+
         self.property_tree.delete(*self.property_tree.get_children())
         if is_browser_properties:
             self._set_flying_path_preview(None)
@@ -1863,6 +1933,8 @@ class LevelViewer(ttk.Frame):
             child.destroy()
         self.edit_vars.clear()
         self.edit_ref = None
+        self._inline_atlas_images = []
+        self.edit_frame.configure(text="Inline picker")
         self.edit_frame.pack_forget()
 
     def _add_edit_entry(self, row: int, key: str, label: str, value: object) -> None:
@@ -2000,7 +2072,7 @@ class LevelViewer(ttk.Frame):
         except (AssertionError, KeyError, ValueError, IndexError, TypeError) as exc:
             messagebox.showerror("GODS entity editor", f"Could not apply edit.\n\n{exc}")
 
-    def _apply_edit_session(self, session: EditSession) -> None:
+    def _apply_edit_session(self, session: EditSession, *, refresh_ui: bool = True) -> None:
         assert self.loaded is not None
         document = self.loaded.document
         try:
@@ -2041,13 +2113,16 @@ class LevelViewer(ttk.Frame):
                 edit_session=session,
                 render_result=render_result,
             )
-            if self.selected_logic_point is not None and self.selected_logic_point.kind == "puzzle" and self.selected_logic_point.index is not None and logic_graph is not None:
+            if refresh_ui and self.selected_logic_point is not None and self.selected_logic_point.kind == "puzzle" and self.selected_logic_point.index is not None and logic_graph is not None:
                 self.selected_logic_point = logic_graph.point_for_puzzle(self.selected_logic_point.index) or self.selected_logic_point
         except Exception as exc:
-            messagebox.showerror("GODS entity editor", f"Could not rebuild edited level.\n\n{exc}")
+            if refresh_ui:
+                messagebox.showerror("GODS entity editor", f"Could not rebuild edited level.\n\n{exc}")
+                return
+            raise
+        if not refresh_ui:
             return
-        self.map_canvas.set_image(self._render_image_with_pending_previews(self.loaded.render_result.image))
-        self.map_canvas.set_overlay(self.loaded.render_result.canvas_overlay)
+        self._update_pending_preview_image()
         self._populate_entity_tree()
         self._populate_puzzle_tree()
         self._update_info()
@@ -2058,6 +2133,28 @@ class LevelViewer(ttk.Frame):
         self.has_unsaved_changes = True
         self.inspect_var.set(f"Applied {session.patch_count} in-memory edit patch(es).")
 
+    def _on_property_clicked(self, event: tk.Event) -> None:
+        """Toggle bool-like property rows directly in the property table.
+
+        Treeview does not host native widgets per cell, so true checkboxes are rendered
+        as a check mark in the value cell and edited with a single click on that cell.
+        Other property kinds still use double-click, but open inline editors rather than
+        modal dialogs.
+        """
+        if event.widget is not getattr(self, "browser_property_tree", None):
+            return
+        item_id = self.property_tree.identify_row(event.y)
+        if not item_id:
+            return
+        if self.property_tree.identify_column(event.x) != "#1":
+            return
+        spec = self.property_edit_specs.get(item_id)
+        if spec is None or spec.pick or spec.atlas is not None or spec.choices != ("0", "1"):
+            return
+        current = self._current_property_editor_value(item_id, spec)
+        current_bool = self._parse_inline_bool_value(current)
+        self._queue_property_edit(spec, "0" if current_bool else "1", item_id)
+
     def _on_property_activated(self, event: tk.Event) -> None:
         if event.widget is not getattr(self, "browser_property_tree", None):
             return
@@ -2065,35 +2162,324 @@ class LevelViewer(ttk.Frame):
         spec = self.property_edit_specs.get(item_id)
         if spec is None:
             return
-        current = self.property_tree.set(item_id, "value")
-        if spec.field in {"pending_event_type", "pending_event_param"}:
-            value = self._ask_choice("Edit property", self.property_tree.item(item_id, "text"), current, spec.choices) if spec.choices else simpledialog.askstring("Edit property", self.property_tree.item(item_id, "text"), initialvalue=current, parent=self)
-            if value is not None:
-                self._update_pending_event_edit(spec, value, item_id)
-            return
         if spec.pick:
+            self._close_inline_property_editor()
+            self._clear_edit_controls()
             self._set_pick_mode(spec)
             return
+        current = self._current_property_editor_value(item_id, spec)
         if spec.atlas is not None:
-            value = self._ask_atlas_value(spec.atlas, current)
-        elif spec.choices:
-            value = self._ask_choice("Edit property", self.property_tree.item(item_id, "text"), current, spec.choices)
-        else:
-            value = simpledialog.askstring("Edit property", self.property_tree.item(item_id, "text"), initialvalue=current, parent=self)
-        if value is None:
+            self._close_inline_property_editor()
+            self._show_inline_atlas_picker(item_id, spec, current)
             return
-        self._queue_property_edit(spec, value, item_id)
+        if spec.choices:
+            self._show_inline_choice_editor(item_id, spec, current)
+            return
+        self._show_inline_text_editor(item_id, spec, current)
+
+    def _current_property_editor_value(self, item_id: str, spec: PropertyEditSpec) -> str:
+        pending = self._pending_edit_for_spec(spec)
+        if pending is not None:
+            return pending.value
+        value = self.property_tree.set(item_id, "value").strip()
+        if value.endswith(" *"):
+            value = value[:-2].rstrip()
+        if spec.choices == ("0", "1"):
+            return "1" if self._parse_inline_bool_value(value) else "0"
+        return value
+
+    @staticmethod
+    def _parse_inline_bool_value(value: str) -> bool:
+        text = value.strip()
+        if text.startswith("☑"):
+            return True
+        if text.startswith("☐"):
+            return False
+        if text in {"1", "true", "True", "yes", "Yes", "on", "On"}:
+            return True
+        if text in {"0", "false", "False", "no", "No", "off", "Off", ""}:
+            return False
+        return text.endswith("1")
+
+    def _close_inline_property_editor(self) -> None:
+        editor = self._inline_cell_editor
+        self._inline_cell_editor = None
+        self._inline_cell_editor_item = None
+        if editor is not None and editor.winfo_exists():
+            editor.destroy()
+
+    def _inline_editor_bbox(self, item_id: str) -> tuple[int, int, int, int] | None:
+        self.property_tree.see(item_id)
+        bbox = self.property_tree.bbox(item_id, "value")
+        if not bbox:
+            return None
+        x, y, width, height = bbox
+        return x + 1, y + 1, max(72, width - 2), max(20, height - 2)
+
+    def _submit_inline_editor_value(self, item_id: str, spec: PropertyEditSpec, value: str) -> None:
+        self._close_inline_property_editor()
+        if spec.field in {"pending_event_type", "pending_event_param"}:
+            self._update_pending_event_edit(spec, value, item_id)
+        else:
+            self._queue_property_edit(spec, value, item_id)
+
+    def _show_inline_choice_editor(self, item_id: str, spec: PropertyEditSpec, current: str) -> None:
+        self._close_inline_property_editor()
+        self._clear_edit_controls()
+        bbox = self._inline_editor_bbox(item_id)
+        if bbox is None:
+            return
+        selected = self._normalise_inline_choice_current(current, spec.choices)
+        var = tk.StringVar(value=selected)
+        combo = ttk.Combobox(
+            self.property_tree,
+            textvariable=var,
+            values=list(spec.choices),
+            state="readonly",
+        )
+        self._inline_cell_editor = combo
+        self._inline_cell_editor_item = item_id
+        combo.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
+
+        committed = {"done": False}
+
+        def submit(_event: tk.Event | None = None) -> str | None:
+            if committed["done"]:
+                return "break"
+            committed["done"] = True
+            self._submit_inline_editor_value(item_id, spec, var.get())
+            return "break"
+
+        combo.bind("<<ComboboxSelected>>", submit)
+        combo.bind("<Return>", submit)
+        combo.bind("<KP_Enter>", submit)
+        combo.bind("<Escape>", lambda _event: (self._close_inline_property_editor(), "break")[1])
+        combo.bind("<FocusOut>", lambda _event: self._close_inline_property_editor())
+        combo.focus_set()
+        combo.event_generate("<Button-1>")
+
+    @staticmethod
+    def _normalise_inline_choice_current(current: str, values: tuple[str, ...]) -> str:
+        if not values:
+            return current
+        if current in values:
+            return current
+        current_text = current.strip()
+        if current_text.endswith(" *"):
+            current_text = current_text[:-2].rstrip()
+        if current_text in values:
+            return current_text
+        try:
+            current_index = int(current_text.split(":", 1)[0])
+        except ValueError:
+            current_index = None
+        if current_index is not None:
+            for value in values:
+                try:
+                    if int(value.split(":", 1)[0]) == current_index:
+                        return value
+                except ValueError:
+                    continue
+        return values[0]
+
+    def _show_inline_text_editor(self, item_id: str, spec: PropertyEditSpec, current: str) -> None:
+        self._close_inline_property_editor()
+        self._clear_edit_controls()
+        bbox = self._inline_editor_bbox(item_id)
+        if bbox is None:
+            return
+        var = tk.StringVar(value=current)
+        entry = ttk.Entry(self.property_tree, textvariable=var)
+        self._inline_cell_editor = entry
+        self._inline_cell_editor_item = item_id
+        entry.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
+
+        committed = {"done": False}
+
+        def submit(_event: tk.Event | None = None) -> str | None:
+            if committed["done"]:
+                return "break"
+            committed["done"] = True
+            self._submit_inline_editor_value(item_id, spec, var.get())
+            return "break"
+
+        def cancel(_event: tk.Event | None = None) -> str:
+            committed["done"] = True
+            self._close_inline_property_editor()
+            return "break"
+
+        entry.bind("<Return>", submit)
+        entry.bind("<KP_Enter>", submit)
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", submit)
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+
+    def _show_inline_atlas_picker(self, item_id: str, spec: PropertyEditSpec, current: str) -> None:
+        if self.loaded is None or spec.atlas is None:
+            return
+        records = self._atlas_records(spec.atlas)
+        if not records:
+            self.inspect_var.set("No valid atlas records are available for this property.")
+            return
+        self._clear_edit_controls()
+        self.edit_frame.configure(text=self._atlas_title(spec.atlas))
+        self.edit_frame.pack(fill=tk.BOTH, pady=(4, 0))
+        self.edit_frame.columnconfigure(0, weight=1)
+        self._inline_atlas_images = []
+
+        header = ttk.Frame(self.edit_frame)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="Select inline:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        filter_var = tk.StringVar()
+        filter_entry = ttk.Entry(header, textvariable=filter_var)
+        filter_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(header, text="Close", command=self._clear_edit_controls).grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+        shell = ttk.Frame(self.edit_frame)
+        shell.grid(row=1, column=0, sticky="nsew")
+        self.edit_frame.rowconfigure(1, weight=1)
+        canvas = tk.Canvas(shell, height=260, background="#202020", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview)
+        grid = ttk.Frame(canvas)
+        grid_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: (canvas.itemconfigure(grid_window, width=event.width), self._layout_atlas_tiles(grid, event.width)))
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"))
+
+        selected_raw = self._atlas_current_value(spec.atlas, current)
+
+        def matching_records() -> list[tuple[int, str, str, object | None]]:
+            needle = filter_var.get().strip().lower()
+            if not needle:
+                return records
+            return [record for record in records if needle in record[1].lower() or needle in record[2].lower() or needle == str(record[0])]
+
+        def render_tiles(*_args: object) -> None:
+            for child in grid.winfo_children():
+                child.destroy()
+            self._inline_atlas_images = []
+            filtered = matching_records()
+            if not filtered:
+                ttk.Label(grid, text="No matching entries.").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+                return
+            for ordinal, (edit_value, title, subtitle, sprite) in enumerate(filtered):
+                tile = ttk.Frame(grid, padding=4, relief="solid" if str(edit_value) == selected_raw else "flat")
+                tile.grid(row=0, column=ordinal, sticky="nsew", padx=2, pady=2)
+                if sprite is not None:
+                    scale = max(1, min(4, 48 // max(1, max(sprite.size))))
+                    preview = sprite.resize((max(1, sprite.width * scale), max(1, sprite.height * scale)), resample=Image.Resampling.NEAREST)
+                    image = ImageTk.PhotoImage(preview)
+                    self._inline_atlas_images.append(image)
+                    ttk.Label(tile, image=image, anchor="center").pack(fill=tk.X)
+                else:
+                    ttk.Label(tile, text="no sprite", anchor="center", width=12).pack(fill=tk.X)
+                ttk.Label(tile, text=title, anchor="w").pack(fill=tk.X)
+                ttk.Label(tile, text=subtitle, width=18, wraplength=118, anchor="w").pack(fill=tk.X)
+
+                def select_record(_event: tk.Event | None = None, value: int = edit_value) -> str:
+                    self._queue_property_edit(spec, str(value), item_id)
+                    self._clear_edit_controls()
+                    return "break"
+
+                for widget in (tile, *tile.winfo_children()):
+                    widget.bind("<Button-1>", select_record)
+            self._layout_atlas_tiles(grid, max(1, canvas.winfo_width()))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        filter_var.trace_add("write", render_tiles)
+        render_tiles()
+        filter_entry.focus_set()
+        self.inspect_var.set(f"Choose {self._atlas_title(spec.atlas).lower()} inline; no dialog will open.")
 
     def _ask_add_map_item(self) -> None:
-        choice = self._ask_choice("Add map item", "Kind", "object", ("object", "weapon"))
-        if choice is None:
-            return
-        atlas = "object" if choice == "object" else "weapon_raw"
-        value = self._ask_atlas_value(atlas, "")
-        if value is None:
-            return
-        self._set_pick_mode(PropertyEditSpec("item_create", ("item_raw", int(value)), pick=True))
-        self.inspect_var.set("Pick mode: click the map to place the new item.")
+        """Open the add-item flow inside the Properties pane rather than in dialogs."""
+        self._close_inline_property_editor()
+        self._clear_edit_controls()
+        self.edit_frame.configure(text="Add map item")
+        self.edit_frame.pack(fill=tk.BOTH, pady=(4, 0))
+        self.edit_frame.columnconfigure(0, weight=1)
+        self.edit_frame.rowconfigure(1, weight=1)
+        self._inline_atlas_images = []
+
+        header = ttk.Frame(self.edit_frame)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        header.columnconfigure(3, weight=1)
+        ttk.Label(header, text="Kind").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        kind_var = tk.StringVar(value="object")
+        kind_combo = ttk.Combobox(header, textvariable=kind_var, values=("object", "weapon"), state="readonly", width=12)
+        kind_combo.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(header, text="Filter").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        filter_var = tk.StringVar()
+        filter_entry = ttk.Entry(header, textvariable=filter_var)
+        filter_entry.grid(row=0, column=3, sticky="ew")
+        ttk.Button(header, text="Close", command=self._clear_edit_controls).grid(row=0, column=4, sticky="e", padx=(6, 0))
+
+        shell = ttk.Frame(self.edit_frame)
+        shell.grid(row=1, column=0, sticky="nsew")
+        canvas = tk.Canvas(shell, height=260, background="#202020", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview)
+        grid = ttk.Frame(canvas)
+        grid_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: (canvas.itemconfigure(grid_window, width=event.width), self._layout_atlas_tiles(grid, event.width)))
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"))
+
+        def atlas_name() -> str:
+            return "object" if kind_var.get() == "object" else "weapon_raw"
+
+        def filtered_records() -> list[tuple[int, str, str, object | None]]:
+            records = self._atlas_records(atlas_name())
+            needle = filter_var.get().strip().lower()
+            if not needle:
+                return records
+            return [record for record in records if needle in record[1].lower() or needle in record[2].lower() or needle == str(record[0])]
+
+        def render_tiles(*_args: object) -> None:
+            for child in grid.winfo_children():
+                child.destroy()
+            self._inline_atlas_images = []
+            records = filtered_records()
+            if not records:
+                ttk.Label(grid, text="No matching entries.").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+                return
+            for ordinal, (edit_value, title, subtitle, sprite) in enumerate(records):
+                tile = ttk.Frame(grid, padding=4)
+                tile.grid(row=0, column=ordinal, sticky="nsew", padx=2, pady=2)
+                if sprite is not None:
+                    scale = max(1, min(4, 48 // max(1, max(sprite.size))))
+                    preview = sprite.resize((max(1, sprite.width * scale), max(1, sprite.height * scale)), resample=Image.Resampling.NEAREST)
+                    image = ImageTk.PhotoImage(preview)
+                    self._inline_atlas_images.append(image)
+                    ttk.Label(tile, image=image, anchor="center").pack(fill=tk.X)
+                else:
+                    ttk.Label(tile, text="no sprite", anchor="center", width=12).pack(fill=tk.X)
+                ttk.Label(tile, text=title, anchor="w").pack(fill=tk.X)
+                ttk.Label(tile, text=subtitle, width=18, wraplength=118, anchor="w").pack(fill=tk.X)
+
+                def select_record(_event: tk.Event | None = None, value: int = edit_value) -> str:
+                    self._clear_edit_controls()
+                    self._set_pick_mode(PropertyEditSpec("item_create", ("item_raw", int(value)), pick=True))
+                    self.inspect_var.set("Pick mode: click the map to place the new item.")
+                    return "break"
+
+                for widget in (tile, *tile.winfo_children()):
+                    widget.bind("<Button-1>", select_record)
+            self._layout_atlas_tiles(grid, max(1, canvas.winfo_width()))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        kind_combo.bind("<<ComboboxSelected>>", render_tiles)
+        filter_var.trace_add("write", render_tiles)
+        render_tiles()
+        filter_entry.focus_set()
+        self.inspect_var.set("Choose the object or weapon inline, then click the map to place it.")
 
     def _ask_add_event(self) -> None:
         if self.loaded is None or self.loaded.alfils_data is None:
@@ -2126,12 +2512,15 @@ class LevelViewer(ttk.Frame):
         self.pending_property_edits.append(PendingPropertyEdit(spec, value, label))
         self._update_pending_edit_state()
         if item_id is not None and self.property_tree.exists(item_id):
-            self.property_tree.set(item_id, "value", f"{self._display_value_for_spec(spec, value)} *")
+            display_value = self._property_tree_display_value(spec, self._display_value_for_spec(spec, value))
+            self.property_tree.set(item_id, "value", f"{display_value} *")
             self._set_pending_tags(self.property_tree, item_id, "pending_delete" if self._is_delete_edit(spec) else "pending_changed")
-        if spec.field in {"event_delete", "event_create", "item_create"}:
-            self._populate_entity_tree()
-        else:
-            self._refresh_pending_marks()
+        # Rebuild from the transient pending projection rather than patching only the
+        # clicked row.  Map-pick edits have no Treeview row id here, and dependent rows
+        # (for example puzzle Effect type -> Object/Weapon atlas) must immediately
+        # reflect the queued state before Apply.
+        self._refresh_pending_aware_browser()
+        self._refresh_pending_marks()
         self._update_pending_preview_image()
         self.inspect_var.set(f"Queued edit: {label}. Press Apply to rebuild the level.")
 
@@ -2178,7 +2567,7 @@ class LevelViewer(ttk.Frame):
             return
 
         self._replace_pending_event_create_state(event_index, event_type, param)
-        self._populate_entity_tree()
+        self._refresh_pending_aware_browser()
 
         # Rebuild the selected pending-event property panel from the canonical queued
         # event_create edit.  Updating only the clicked Treeview row used to write the
@@ -2232,6 +2621,21 @@ class LevelViewer(ttk.Frame):
             return f"{ref_value.label} {spec.field} = {self._display_value_for_spec(spec, value)}"
         return f"{spec.field} = {self._display_value_for_spec(spec, value)}"
 
+
+    def _condition_type_for_param_spec(self, spec: PropertyEditSpec) -> int | None:
+        if not (spec.field.startswith("cond") and spec.field.endswith("_param")):
+            return None
+        try:
+            slot = int(spec.field[4])
+        except ValueError:
+            return None
+        ref_kind, ref_value = spec.ref
+        if ref_kind != "point" or not isinstance(ref_value, LogicPoint) or ref_value.index is None:
+            return None
+        if self.loaded is None or not (0 <= ref_value.index < len(self.loaded.map_data.puzzles)):
+            return None
+        return self.loaded.map_data.puzzles[ref_value.index].condition_function_indices[slot]
+
     def _display_value_for_spec(self, spec: PropertyEditSpec, value: str) -> str:
         if spec.atlas == "object":
             return self._object_ref(int(value))
@@ -2245,6 +2649,15 @@ class LevelViewer(ttk.Frame):
             kind = spec.atlas.split("_", 1)[1]
             info = get_enemy_info(self.loaded.resource.level, kind, int(value)) if self.loaded is not None else None
             return f"EN{value}: {info.display_name if info is not None else 'enemy'}"
+        if spec.field == "wave_function":
+            return self._walking_wave_function_label(self._choice_index_or_leading_int(value))
+        if spec.field == "wave_missile_type":
+            return self._walking_wave_missile_type_label(self._choice_index_or_leading_int(value))
+        if spec.field.startswith("cond") and spec.field.endswith("_param"):
+            condition_type = self._condition_type_for_param_spec(spec)
+            if condition_type is not None:
+                parsed = self._parse_condition_param_value(condition_type, value)
+                return self._condition_param_presentation(condition_type, parsed).summary
         if spec.field == "item_create":
             raw_text, x_text, y_text = value.split(",", 2)
             raw_id = int(raw_text)
@@ -2320,9 +2733,8 @@ class LevelViewer(ttk.Frame):
     def clear_pending_property_edits(self) -> None:
         self.pending_property_edits.clear()
         self._update_pending_edit_state()
-        self._populate_entity_tree()
-        if self.loaded is not None and getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
-            self._update_entity_properties()
+        self._refresh_pending_aware_browser()
+        self._refresh_pending_marks()
         self._update_pending_preview_image()
 
     def apply_pending_property_edits(self) -> None:
@@ -2374,85 +2786,6 @@ class LevelViewer(ttk.Frame):
         backup = path.with_name(f"{path.name}.bak")
         if not backup.exists():
             backup.write_bytes(path.read_bytes())
-
-    def _ask_choice(self, title: str, label: str, current: str, values: tuple[str, ...]) -> str | None:
-        dialog = tk.Toplevel(self)
-        dialog.title(title)
-        dialog.transient(self.winfo_toplevel())
-        dialog.grab_set()
-        result: dict[str, str | None] = {"value": None}
-        ttk.Label(dialog, text=label).pack(anchor="w", padx=8, pady=(8, 2))
-        var = tk.StringVar(value=current if current in values else values[0])
-        combo = ttk.Combobox(dialog, textvariable=var, values=list(values), state="readonly", width=36)
-        combo.pack(fill=tk.X, padx=8, pady=4)
-        buttons = ttk.Frame(dialog)
-        buttons.pack(fill=tk.X, padx=8, pady=(4, 8))
-        ttk.Button(buttons, text="Apply", command=lambda: (result.__setitem__("value", var.get()), dialog.destroy())).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
-        combo.focus_set()
-        self.wait_window(dialog)
-        return result["value"]
-
-    def _ask_atlas_value(self, atlas: str, current: str) -> str | None:
-        if self.loaded is None:
-            return None
-        records = self._atlas_records(atlas)
-        if not records:
-            messagebox.showinfo("GODS entity editor", "No atlas records are available for this value.")
-            return None
-
-        dialog = tk.Toplevel(self)
-        dialog.title(self._atlas_title(atlas))
-        dialog.transient(self.winfo_toplevel())
-        dialog.grab_set()
-        result: dict[str, str | None] = {"value": None}
-
-        header = ttk.Frame(dialog)
-        header.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(header, text="Double-click an entry, or select and Apply.").pack(side=tk.LEFT)
-
-        shell = ttk.Frame(dialog)
-        shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        canvas = tk.Canvas(shell, width=620, height=420, background="#202020", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview)
-        grid = ttk.Frame(canvas)
-        grid_window = canvas.create_window((0, 0), window=grid, anchor="nw")
-        grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: (canvas.itemconfigure(grid_window, width=event.width), self._layout_atlas_tiles(grid, event.width)))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        values = {str(edit_value) for edit_value, _title, _subtitle, _sprite in records}
-        current_value = self._atlas_current_value(atlas, current)
-        selected = tk.StringVar(value=current_value if current_value in values else str(records[0][0]))
-        images: list[ImageTk.PhotoImage] = []
-        for ordinal, (edit_value, title, subtitle, sprite) in enumerate(records):
-            tile = ttk.Frame(grid, padding=4)
-            tile.grid(row=0, column=ordinal, sticky="nsew", padx=2, pady=2)
-            if sprite is not None:
-                scale = max(1, min(4, 48 // max(1, max(sprite.size))))
-                preview = sprite.resize((max(1, sprite.width * scale), max(1, sprite.height * scale)), resample=Image.Resampling.NEAREST)
-                image = ImageTk.PhotoImage(preview)
-                images.append(image)
-                image_label = ttk.Label(tile, image=image, anchor="center")
-            else:
-                image_label = ttk.Label(tile, text="no sprite", anchor="center", width=12)
-            image_label.pack(fill=tk.X)
-            ttk.Radiobutton(tile, text=title, value=str(edit_value), variable=selected).pack(anchor="w")
-            ttk.Label(tile, text=subtitle, width=18, wraplength=118).pack(anchor="w")
-            for widget in tile.winfo_children():
-                widget.bind("<Double-Button-1>", lambda _event, value=str(edit_value): (result.__setitem__("value", value), dialog.destroy()))
-                widget.bind("<Button-1>", lambda _event, value=str(edit_value): selected.set(value))
-
-        buttons = ttk.Frame(dialog)
-        buttons.pack(fill=tk.X, padx=8, pady=(4, 8))
-        ttk.Button(buttons, text="Apply", command=lambda: (result.__setitem__("value", selected.get()), dialog.destroy())).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
-        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"))
-        dialog._atlas_images = images  # type: ignore[attr-defined]
-        self.wait_window(dialog)
-        return result["value"]
 
     @staticmethod
     def _layout_atlas_tiles(grid: ttk.Frame, width: int) -> None:
@@ -2544,7 +2877,7 @@ class LevelViewer(ttk.Frame):
             raise ValueError(f"Expected numeric id in {text!r}.")
         return int("".join(digits))
 
-    def _apply_property_edit(self, spec: PropertyEditSpec, value: str, *, show_errors: bool = False) -> bool:
+    def _apply_property_edit(self, spec: PropertyEditSpec, value: str, *, show_errors: bool = False, refresh_ui: bool = True) -> bool:
         if self.loaded is None:
             return False
         ref_kind, ref_value = spec.ref
@@ -2558,12 +2891,12 @@ class LevelViewer(ttk.Frame):
                 if spec.field == "event_create":
                     type_text, param_text = value.split(",", 1)
                     session = session.plan_set_event(event_index, event_type_index=int(type_text), param=int(param_text))
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 if spec.field == "event_delete":
                     session = session.plan_set_event(event_index, event_type_index=11, param=0)
                     session = session.plan_set_event_trigger_cells(event_index, ())
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 if spec.field == "event_type":
                     event_type = self._choice_index(value)
@@ -2576,7 +2909,7 @@ class LevelViewer(ttk.Frame):
                         raise IndexError(f"Event trigger cell index {cell_index} is out of range.")
                     cells[cell_index] = self._parse_cell(value)
                     session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 elif spec.field.startswith("event_delete_cell:"):
                     cells = list(self.loaded.logic_graph.event_cells.get(event_index, ())) if self.loaded.logic_graph is not None else []
@@ -2585,7 +2918,7 @@ class LevelViewer(ttk.Frame):
                         raise IndexError(f"Event trigger cell index {cell_index} is out of range.")
                     del cells[cell_index]
                     session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 elif spec.field == "event_add_cell":
                     cells = list(self.loaded.logic_graph.event_cells.get(event_index, ())) if self.loaded.logic_graph is not None else []
@@ -2593,7 +2926,7 @@ class LevelViewer(ttk.Frame):
                     if cell not in cells:
                         cells.append(cell)
                     session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 else:
                     return False
@@ -2646,7 +2979,7 @@ class LevelViewer(ttk.Frame):
                 elif spec.field == "wave_facing":
                     fields["facing"] = int(value)
                 elif spec.field == "wave_function":
-                    fields["function_index_unknown"] = int(value)
+                    fields["function_index_unknown"] = self._choice_index_or_leading_int(value)
                 elif spec.field == "wave_spawn_delay":
                     fields["spawn_delay"] = int(value)
                 elif spec.field == "wave_enemy_count":
@@ -2654,7 +2987,7 @@ class LevelViewer(ttk.Frame):
                 elif spec.field == "wave_health":
                     fields["health"] = int(value)
                 elif spec.field == "wave_missile_type":
-                    fields["missile_type"] = int(value)
+                    fields["missile_type"] = self._choice_index_or_leading_int(value)
                 elif spec.field == "wave_speed":
                     fields["speed_value"] = int(value)
                 elif spec.field == "wave_reward":
@@ -2678,7 +3011,7 @@ class LevelViewer(ttk.Frame):
                     else:
                         return False
                     session = session.plan_set_switch(point.index, pixel_x=pixel_x, pixel_y=pixel_y, object_info_index=object_info_index)
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 if point.kind == "destructable_object" and point.index is not None:
                     if not 0 <= point.index < len(self.loaded.map_data.items):
@@ -2695,7 +3028,7 @@ class LevelViewer(ttk.Frame):
                     else:
                         return False
                     session = session.plan_set_map_item(item.index, pixel_x=pixel_x, pixel_y=pixel_y, raw_id=raw_id)
-                    self._apply_edit_session(session)
+                    self._apply_edit_session(session, refresh_ui=refresh_ui)
                     return True
                 if point.kind != "puzzle" or point.index is None:
                     return False
@@ -2716,9 +3049,10 @@ class LevelViewer(ttk.Frame):
                 elif spec.field.startswith("cond") and spec.field.endswith("_type"):
                     slot = int(spec.field[4])
                     cond_types[slot] = self._choice_index(value)
+                    cond_params[slot] = self._normalise_condition_param_for_type(cond_types[slot], cond_params[slot])
                 elif spec.field.startswith("cond") and spec.field.endswith("_param"):
                     slot = int(spec.field[4])
-                    cond_params[slot] = int(value)
+                    cond_params[slot] = self._parse_condition_param_value(cond_types[slot], value)
                 else:
                     return False
                 session = session.plan_set_puzzle(
@@ -2733,7 +3067,7 @@ class LevelViewer(ttk.Frame):
                 )
             else:
                 return False
-            self._apply_edit_session(session)
+            self._apply_edit_session(session, refresh_ui=refresh_ui)
             return True
         except (AssertionError, ValueError, IndexError, TypeError) as exc:
             if show_errors:
@@ -2748,48 +3082,67 @@ class LevelViewer(ttk.Frame):
                 return session.plan_set_switch(switch.index, pixel_x=pixel_x, pixel_y=pixel_y, object_info_index=raw_id)
         return session
 
+    def _build_pending_preview_loaded(self) -> LoadedLevel | None:
+        """Return a transient LoadedLevel with queued edits projected onto it.
+
+        Pending edits intentionally remain unapplied to the real editor document until
+        the user presses Apply, but the browser/map should behave as if those edits are
+        already present.  Replaying the queued high-level edits against a temporary
+        decoded snapshot keeps every dependent view in one consistent state: dynamic
+        property rows, event trigger cells, map overlays, entity pickers, and render
+        previews all see the same pending model.
+        """
+        if self.loaded is None or not self.pending_property_edits:
+            return self.loaded
+        committed_loaded = self.loaded
+        preview_loaded: LoadedLevel | None = committed_loaded
+        try:
+            for edit in self.pending_property_edits:
+                if not self._apply_property_edit(edit.spec, edit.value, show_errors=False, refresh_ui=False):
+                    return preview_loaded
+            preview_loaded = self.loaded
+            return preview_loaded
+        finally:
+            self.loaded = committed_loaded
+
+    def _refresh_pending_aware_browser(self) -> None:
+        """Rebuild browser/property panes from the pending projection when possible."""
+        if self.loaded is None:
+            return
+        preview_loaded = self._build_pending_preview_loaded()
+        if preview_loaded is None or preview_loaded is self.loaded:
+            self._populate_entity_tree()
+            self._populate_puzzle_tree()
+            if getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+                self._update_entity_properties()
+            return
+        committed_loaded = self.loaded
+        try:
+            self.loaded = preview_loaded
+            self._populate_entity_tree()
+            self._populate_puzzle_tree()
+            if getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+                self._update_entity_properties()
+        finally:
+            self.loaded = committed_loaded
+
     def _update_pending_preview_image(self) -> None:
         if self.loaded is None:
             return
-        self.map_canvas.set_image(self._render_image_with_pending_previews(self.loaded.render_result.image))
+        preview_loaded = self._build_pending_preview_loaded()
+        display_loaded = preview_loaded if preview_loaded is not None else self.loaded
+        self.map_canvas.set_image(display_loaded.render_result.image)
+        self.map_canvas.set_overlay(display_loaded.render_result.canvas_overlay)
 
     def _render_image_with_pending_previews(self, base_image):
-        if self.loaded is None or self.loaded.sprite_bank is None or not self.pending_property_edits:
+        # Legacy call sites still ask for a "pending preview" image.  The editor now
+        # projects the entire queued edit list into a transient decoded level instead
+        # of alpha-compositing only a few moved sprites.  That keeps events, puzzles,
+        # waves, logic overlays, and dynamic browser values in sync.
+        preview_loaded = self._build_pending_preview_loaded()
+        if preview_loaded is None or preview_loaded is self.loaded:
             return base_image
-        preview = base_image.copy().convert("RGBA")
-        for edit in self.pending_property_edits:
-            sprite = None
-            x_y: tuple[int, int] | None = None
-            raw_id: int | None = None
-            if edit.spec.field == "item_position" and edit.spec.ref[0] == "item" and isinstance(edit.spec.ref[1], MapItemSelection):
-                item = self._map_item_for_selection(edit.spec.ref[1])
-                if item is None:
-                    continue
-                raw_id = item.object_or_weapon_info_index
-                x_y = self._parse_position(edit.value)
-            elif edit.spec.field == "destructible_position" and edit.spec.ref[0] == "point" and isinstance(edit.spec.ref[1], LogicPoint):
-                point = edit.spec.ref[1]
-                if point.index is None or not 0 <= point.index < len(self.loaded.map_data.items):
-                    continue
-                item = self.loaded.map_data.items[point.index]
-                if not item.is_object:
-                    continue
-                raw_id = item.object_or_weapon_info_index
-                x_y = self._parse_position(edit.value)
-            elif edit.spec.field == "item_create":
-                raw_text, x_text, y_text = edit.value.split(",", 2)
-                raw_id = int(raw_text)
-                x_y = (int(x_text), int(y_text))
-            if raw_id is None or x_y is None:
-                continue
-            if raw_id >= 192:
-                sprite = self.loaded.sprite_bank.weapon_sprite(raw_id - 192)
-            else:
-                sprite = self.loaded.sprite_bank.object_sprite(raw_id)
-            if sprite is None:
-                continue
-            preview.alpha_composite(sprite, x_y)
-        return preview
+        return preview_loaded.render_result.image
 
     @staticmethod
     def _parse_position(value: str) -> tuple[int, int]:
@@ -2806,28 +3159,82 @@ class LevelViewer(ttk.Frame):
             return
         snapshot = self._selection_snapshot()
         original_tree = self.property_tree
+        original_browser_ref = self.browser_selected_ref
         try:
             self.property_tree = tree
+            # Context/property helper calls need to render the explicit ref, not
+            # recurse through the Browse-tab browser_selected_ref override.
+            if tree is not getattr(self, "browser_property_tree", None):
+                self.browser_selected_ref = None
             self._set_selection_from_ref_for_properties(ref)
             self._update_entity_properties()
         finally:
             self.property_tree = original_tree
+            self.browser_selected_ref = original_browser_ref
+            self._restore_selection_snapshot(snapshot)
+
+    def _populate_browser_properties_for_ref(self, ref: tuple[str, object] | None) -> None:
+        """Populate Browse-tab Properties from the browser edit selection only.
+
+        This deliberately does not change selected_event_index, selected_logic_point,
+        selected_enemy_wave, etc.  Those fields describe the highlighted map/context
+        selection.  The inline property grid has its own active row in
+        browser_selected_ref so editing a puzzle does not snap back to a previously
+        highlighted event after a pending refresh.
+        """
+        if not hasattr(self, "property_tree"):
+            return
+        self.property_tree.delete(*self.property_tree.get_children())
+        self._set_flying_path_preview(None)
+        self._clear_edit_controls()
+        self.property_edit_specs.clear()
+        if ref is None:
+            self.property_tree.insert("", tk.END, text="Selection", values=("None",))
+            return
+        if ref[0] == "item_raw":
+            root = self._insert_property_section("Pending new map item", "pending", open=True)
+            for edit in self.pending_property_edits:
+                if edit.spec.ref == ref and edit.spec.field == "item_create":
+                    self._insert_property(root, "Create", self._display_value_for_spec(edit.spec, edit.value), "pending")
+            return
+        if ref[0] == "pending_event":
+            self._populate_properties_tree_for_pending_event(int(ref[1]))
+            return
+        snapshot = self._selection_snapshot()
+        original_browser_ref = self.browser_selected_ref
+        try:
+            # Avoid the browser-selected override while temporarily rendering this ref.
+            self.browser_selected_ref = None
+            self._set_selection_from_ref_for_properties(ref)
+            self._update_entity_properties()
+        finally:
+            self.browser_selected_ref = original_browser_ref
             self._restore_selection_snapshot(snapshot)
 
     def _insert_property_section(self, title: str, source: str, *, open: bool = True) -> str:
         return self.property_tree.insert("", tk.END, text=title, values=("",), open=open)
 
     def _insert_property(self, parent: str, field: str, value: object, source: str, *, open: bool = True, edit: PropertyEditSpec | None = None) -> str:
-        iid = self.property_tree.insert(parent, tk.END, text=field, values=(str(value),), open=open)
+        display_value = self._property_tree_display_value(edit, str(value))
+        iid = self.property_tree.insert(parent, tk.END, text=field, values=(display_value,), open=open)
         if edit is not None and getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
             self.property_edit_specs[iid] = edit
             self.property_tree.item(iid, tags=("editable",))
             self.property_tree.tag_configure("editable", foreground="#005bbb")
             pending = self._pending_edit_for_spec(edit)
             if pending is not None:
-                self.property_tree.set(iid, "value", f"{self._display_value_for_spec(pending.spec, pending.value)} *")
+                pending_display = self._property_tree_display_value(pending.spec, self._display_value_for_spec(pending.spec, pending.value))
+                self.property_tree.set(iid, "value", f"{pending_display} *")
                 self._set_pending_tags(self.property_tree, iid, "pending_delete" if self._is_delete_edit(pending.spec) else "pending_changed")
         return iid
+
+    @staticmethod
+    def _property_tree_display_value(edit: PropertyEditSpec | None, value: str) -> str:
+        if edit is not None and edit.choices == ("0", "1"):
+            text = value.strip()
+            if text in {"0", "1"}:
+                return f"{'☑' if text == '1' else '☐'} {text}"
+        return value
 
     def _pending_edit_for_spec(self, spec: PropertyEditSpec) -> PendingPropertyEdit | None:
         for edit in reversed(self.pending_property_edits):
@@ -2933,6 +3340,33 @@ class LevelViewer(ttk.Frame):
             return "IF", alfils.intel_flying_waves[event.param], "flying", "intelligent flying wave"
         return None
 
+
+    @staticmethod
+    def _choice_index_or_leading_int(value: str) -> int:
+        text = str(value).strip()
+        try:
+            return LevelViewer._choice_index(text)
+        except (ValueError, IndexError):
+            return int(LevelViewer._leading_integer(text))
+
+    @staticmethod
+    def _labelled_choice(index: int, labels: dict[int, str], fallback_prefix: str) -> str:
+        return f"{index}: {labels.get(index, f'{fallback_prefix} {index}')}"
+
+    def _walking_wave_function_label(self, index: int) -> str:
+        return self._labelled_choice(int(index), WALKING_WAVE_FUNCTION_NAMES, "Walking AI function")
+
+    def _walking_wave_missile_type_label(self, index: int) -> str:
+        return self._labelled_choice(int(index), WALKING_WAVE_MISSILE_TYPE_NAMES, "Missile pattern")
+
+    def _walking_wave_function_choices(self, current: int | None = None) -> tuple[str, ...]:
+        values = sorted(set(WALKING_WAVE_FUNCTION_NAMES) | ({int(current)} if current is not None else set()))
+        return tuple(self._walking_wave_function_label(index) for index in values)
+
+    def _walking_wave_missile_type_choices(self, current: int | None = None) -> tuple[str, ...]:
+        values = sorted(set(WALKING_WAVE_MISSILE_TYPE_NAMES) | ({int(current)} if current is not None else set()))
+        return tuple(self._walking_wave_missile_type_label(index) for index in values)
+
     def _insert_wave_fields(self, parent: str, prefix: str, wave, enemy_kind: str, source: str) -> None:
         ref = ("wave", EnemySelection(prefix, wave.index, None, getattr(wave, "pixel_x", None), getattr(wave, "pixel_y", None)))
         editable_ww = prefix == "WW"
@@ -2950,8 +3384,22 @@ class LevelViewer(ttk.Frame):
         if hasattr(wave, "facing"):
             self._insert_property(parent, "Facing", getattr(wave, "facing"), source, edit=PropertyEditSpec("wave_facing", ref, ("0", "1")) if editable_ww else None)
         if editable_ww:
-            self._insert_property(parent, "Action/function", getattr(wave, "function_index_unknown"), source, edit=PropertyEditSpec("wave_function", ref))
-            self._insert_property(parent, "Missile type", getattr(wave, "missile_type"), source, edit=PropertyEditSpec("wave_missile_type", ref))
+            function_value = getattr(wave, "function_index_unknown")
+            missile_value = getattr(wave, "missile_type")
+            self._insert_property(
+                parent,
+                "Action/function",
+                self._walking_wave_function_label(function_value),
+                source,
+                edit=PropertyEditSpec("wave_function", ref, self._walking_wave_function_choices(function_value)),
+            )
+            self._insert_property(
+                parent,
+                "Missile type",
+                self._walking_wave_missile_type_label(missile_value),
+                source,
+                edit=PropertyEditSpec("wave_missile_type", ref, self._walking_wave_missile_type_choices(missile_value)),
+            )
             self._insert_property(parent, "Speed", getattr(wave, "speed_value"), source, edit=PropertyEditSpec("wave_speed", ref))
         if prefix == "FW":
             self._insert_property(parent, "Flying path", f"FP{wave.flying_path_index}", ".PAT")
@@ -3016,7 +3464,8 @@ class LevelViewer(ttk.Frame):
                 open=True,
             )
             self._insert_property(condition_parent, "Type", f"{condition_type}: {condition_type_name(condition_type)}", "map", edit=PropertyEditSpec(f"cond{slot}_type", ref, condition_choices))
-            self._insert_property(condition_parent, "Param", param, "map", edit=PropertyEditSpec(f"cond{slot}_param", ref))
+            param_field, param_value, param_source, param_spec = self._condition_param_edit_descriptor(slot, ref, condition_type, param)
+            self._insert_property(condition_parent, param_field, param_value, param_source, edit=param_spec)
             self._insert_puzzle_condition_param_fields(condition_parent, condition_type, param)
 
     def _insert_event_effect_tree(self, parent: str, event) -> None:
@@ -3387,6 +3836,108 @@ class LevelViewer(ttk.Frame):
             PropertyRow("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
         )
 
+
+    def _event_condition_label(self, event_index: int) -> str:
+        if self.loaded is None or self.loaded.alfils_data is None:
+            return f"E{event_index}"
+        event = self.loaded.alfils_data.event(event_index)
+        return f"E{event_index}: {self._event_action_text(event)}" if event is not None else f"E{event_index}"
+
+    def _event_condition_choices(self) -> tuple[str, ...]:
+        if self.loaded is None or self.loaded.alfils_data is None:
+            return ()
+        return tuple(self._event_condition_label(event.index) for event in self.loaded.alfils_data.active_events)
+
+    def _switch_condition_choices(self) -> tuple[str, ...]:
+        if self.loaded is None or self.loaded.alfils_data is None:
+            return ()
+        return tuple(self._switch_binding_text(switch.index) for switch in self.loaded.alfils_data.active_switches)
+
+    def _condition_param_edit_descriptor(
+        self,
+        slot: int,
+        ref: tuple[str, object],
+        condition_type: int,
+        param: int,
+    ) -> tuple[str, str, str, PropertyEditSpec]:
+        field = f"cond{slot}_param"
+        if condition_type in (1, 2):
+            return "Object", self._object_ref(param), "object table", PropertyEditSpec(field, ref, atlas="object")
+        if condition_type in (3, 4):
+            return "Weapon", self._weapon_ref(param), "weapon table", PropertyEditSpec(field, ref, atlas="weapon")
+        if condition_type in (5, 6):
+            return "Event", self._event_condition_label(param - 1), "PALFILS", PropertyEditSpec(field, ref, self._event_condition_choices())
+        if condition_type in (7, 8):
+            return "Health threshold", f"{param}/24", "decoded", PropertyEditSpec(field, ref)
+        if condition_type in (9, 10):
+            return "Time threshold", f"{param * 5}s", "decoded", PropertyEditSpec(field, ref)
+        if condition_type in (11, 12):
+            return "Switch", self._switch_binding_text(param), "PALFILS", PropertyEditSpec(field, ref, self._switch_condition_choices())
+        if condition_type in (13, 14):
+            return "Score threshold", str(param * 5000), "decoded", PropertyEditSpec(field, ref)
+        if condition_type in (15, 16):
+            return "Lives threshold", str(param), "decoded", PropertyEditSpec(field, ref)
+        return "Raw param", str(param), "map", PropertyEditSpec(field, ref)
+
+    @staticmethod
+    def _parse_scaled_number(text: str, *, suffix: str = "", divisor: int = 1) -> int:
+        cleaned = str(text).strip().lower().replace(" ", "")
+        if suffix and cleaned.endswith(suffix.lower()):
+            cleaned = cleaned[: -len(suffix)]
+        if "/" in cleaned and divisor == 1:
+            cleaned = cleaned.split("/", 1)[0]
+        number = float(cleaned)
+        return int(round(number / divisor))
+
+    def _normalise_condition_param_for_type(self, condition_type: int, param: int) -> int:
+        if self.loaded is None:
+            return param
+        if condition_type in (1, 2) and self.loaded.object_table is not None:
+            valid = [record.index for record in self.loaded.object_table.records]
+            return param if param in valid else (valid[0] if valid else param)
+        if condition_type in (3, 4) and self.loaded.weapon_table is not None:
+            valid = [record.index for record in self.loaded.weapon_table.records]
+            return param if param in valid else (valid[0] if valid else param)
+        if condition_type in (5, 6) and self.loaded.alfils_data is not None:
+            valid = [event.index + 1 for event in self.loaded.alfils_data.active_events]
+            return param if param in valid else (valid[0] if valid else 1)
+        if condition_type in (11, 12) and self.loaded.alfils_data is not None:
+            valid = [switch.index for switch in self.loaded.alfils_data.active_switches]
+            return param if param in valid else (valid[0] if valid else 0)
+        if condition_type in (9, 10):
+            return max(0, param)
+        return param
+
+    def _parse_condition_param_value(self, condition_type: int, value: str) -> int:
+        text = str(value).strip()
+        if condition_type in (1, 2):
+            upper = text.upper()
+            if upper.startswith("OBJ"):
+                return self._leading_integer(upper[3:])
+            return self._choice_index_or_leading_int(text)
+        if condition_type in (3, 4):
+            upper = text.upper()
+            if upper.startswith("WPN"):
+                return self._leading_integer(upper[3:])
+            return self._choice_index_or_leading_int(text)
+        if condition_type in (5, 6):
+            upper = text.upper()
+            if upper.startswith("E"):
+                return self._leading_integer(upper[1:]) + 1
+            return self._choice_index_or_leading_int(text) + 1
+        if condition_type in (7, 8):
+            return self._parse_scaled_number(text.split("/", 1)[0])
+        if condition_type in (9, 10):
+            return self._parse_scaled_number(text, suffix="s", divisor=5)
+        if condition_type in (11, 12):
+            upper = text.upper()
+            if upper.startswith("S"):
+                return self._leading_integer(upper[1:])
+            return self._choice_index_or_leading_int(text)
+        if condition_type in (13, 14):
+            return self._parse_scaled_number(text, divisor=5000)
+        return self._choice_index_or_leading_int(text)
+
     def _condition_param_presentation(self, condition_type: int, param: int) -> ConditionParamPresentation:
         if condition_type == 0:
             return ConditionParamPresentation("")
@@ -3398,7 +3949,7 @@ class LevelViewer(ttk.Frame):
             return ConditionParamPresentation(value, (PropertyRow("Weapon", value, "weapon table"),))
         if condition_type in (5, 6):
             event_index = param - 1
-            value = self._event_trigger_text(event_index)
+            value = self._event_condition_label(event_index)
             return ConditionParamPresentation(
                 value,
                 (PropertyRow("Event", value, "PALFILS"),),
@@ -3730,6 +4281,11 @@ class LevelViewer(ttk.Frame):
         if preserved_group in self.entity_group_frames:
             self._show_entity_group(preserved_group)
         self._update_entity_tree_highlight()
+        # Rebuilding the browser destroys the Treeview widgets.  Pending edits do
+        # that deliberately so the projected values appear immediately, but the UI
+        # must then reselect the same logical entity; otherwise editing a wave field
+        # such as Facing makes the browser look as if the wave was deselected.
+        self._sync_entity_browser_to_selection()
 
     def _insert_pending_entity_rows(self) -> None:
         for edit in self.pending_property_edits:
@@ -4266,21 +4822,8 @@ class LevelViewer(ttk.Frame):
         if not selection:
             return
         ref = self.entity_refs.get(selection[0])
-        if ref is None:
-            self.property_tree.delete(*self.property_tree.get_children())
-            self.property_tree.insert("", tk.END, text="Selection", values=("None",))
-            return
-        if ref[0] == "item_raw":
-            self.property_tree.delete(*self.property_tree.get_children())
-            root = self._insert_property_section("Pending new map item", "pending", open=True)
-            for edit in self.pending_property_edits:
-                if edit.spec.ref == ref and edit.spec.field == "item_create":
-                    self._insert_property(root, "Create", self._display_value_for_spec(edit.spec, edit.value), "pending")
-            return
-        if ref[0] == "pending_event":
-            self._populate_properties_tree_for_pending_event(int(ref[1]))
-            return
-        self._populate_properties_tree_for_ref(self.property_tree, ref)
+        self.browser_selected_ref = ref
+        self._populate_browser_properties_for_ref(ref)
 
     def _on_entity_selected(self, _event: tk.Event) -> None:
         tree = _event.widget
@@ -4366,18 +4909,24 @@ class LevelViewer(ttk.Frame):
         self._rerender_loaded()
 
 
-    def _sync_entity_browser_to_selection(self) -> None:
+    def _sync_entity_browser_to_selection(self, *, prefer_context: bool = False) -> None:
         target: tuple[str, object] | None = None
-        if self.selected_map_item is not None:
-            target = ("item", self.selected_map_item)
-        elif self.selected_enemy_wave is not None:
-            target = ("wave", self.selected_enemy_wave)
-        elif self.selected_logic_point is not None:
-            target = ("point", self.selected_logic_point)
-        elif self.selected_event_index is not None:
-            target = ("event", self.selected_event_index)
-        elif self.selected_flying_path_index is not None:
-            target = ("path", self.selected_flying_path_index)
+        # Normal browser rebuilds should preserve the row being edited in Properties.
+        # The map/context selection is only preferred for explicit reveal/highlight
+        # actions, such as double-clicking the rendered map.
+        if not prefer_context:
+            target = self.browser_selected_ref
+        if target is None:
+            if self.selected_map_item is not None:
+                target = ("item", self.selected_map_item)
+            elif self.selected_enemy_wave is not None:
+                target = ("wave", self.selected_enemy_wave)
+            elif self.selected_logic_point is not None:
+                target = ("point", self.selected_logic_point)
+            elif self.selected_event_index is not None:
+                target = ("event", self.selected_event_index)
+            elif self.selected_flying_path_index is not None:
+                target = ("path", self.selected_flying_path_index)
         if target is None:
             return
         for item_id, ref in self.entity_refs.items():
@@ -4403,7 +4952,7 @@ class LevelViewer(ttk.Frame):
             self._on_map_clicked(image_x, image_y)
             return
         self._on_map_clicked(image_x, image_y)
-        self._sync_entity_browser_to_selection()
+        self._sync_entity_browser_to_selection(prefer_context=True)
 
     def _on_map_clicked(self, image_x: int, image_y: int) -> None:
         if self.loaded is None:
