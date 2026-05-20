@@ -307,17 +307,80 @@ def build_entity_index(document: LevelDocument) -> EntityIndex:
         ))
 
     target_groups: OrderedDict[str, list[IndexedEntity]] = OrderedDict()
+    derived_effects: list[IndexedEntity] = []
+    derived_destructibles: list[IndexedEntity] = []
+    seen_derived: set[tuple[str, int | None, int | None, int, int, str]] = set()
+    for edge in graph.all_edges:
+        if edge.edge_kind != "puzzle_effect" or edge.source.kind != "puzzle" or edge.source.index is None:
+            continue
+        point = edge.target
+        if point.kind in {"spawned_object", "spawned_weapon"}:
+            key = (point.kind, edge.source.index, point.index, point.pixel_x, point.pixel_y, point.label)
+            if key in seen_derived:
+                continue
+            seen_derived.add(key)
+            derived_effects.append(_point_entity(
+                family="puzzle_effect",
+                group="Spawn effects",
+                index=edge.source.index,
+                variant=point.kind,
+                label=f"P{edge.source.index}",
+                kind="point",
+                point=point,
+            ))
+        elif point.kind == "destructable_object":
+            key = (point.kind, None, point.index, point.pixel_x, point.pixel_y, point.label)
+            if key in seen_derived:
+                continue
+            seen_derived.add(key)
+            derived_destructibles.append(_point_entity(
+                family="map_item",
+                group="Destructible targets",
+                index=point.index if point.index is not None else point.label,
+                variant=point.kind,
+                label=f"I{point.index}" if point.index is not None else point.label,
+                kind="point",
+                point=point,
+            ))
+        elif point.kind == "spawned_destructable_object":
+            key = (point.kind, edge.source.index, point.index, point.pixel_x, point.pixel_y, point.label)
+            if key in seen_derived:
+                continue
+            seen_derived.add(key)
+            derived_destructibles.append(_point_entity(
+                family="puzzle_effect",
+                group="Destructible targets",
+                index=edge.source.index,
+                variant=point.kind,
+                label=f"P{edge.source.index}",
+                kind="point",
+                point=point,
+            ))
+        elif point.kind in {"destroy_type4_unresolved", "destroy_type4_offmap"}:
+            key = (point.kind, edge.source.index, point.index, point.pixel_x, point.pixel_y, point.label)
+            if key in seen_derived:
+                continue
+            seen_derived.add(key)
+            derived_destructibles.append(_point_entity(
+                family="puzzle_effect",
+                group="Destructible targets",
+                index=edge.source.index,
+                variant=point.kind,
+                label=f"P{edge.source.index}",
+                kind="point",
+                point=point,
+            ))
+
+    if derived_effects:
+        _append_group(groups, "Spawn effects", sorted(derived_effects, key=_entity_label_sort_key))
+    if derived_destructibles:
+        _append_group(groups, "Destructible targets", sorted(derived_destructibles, key=_entity_label_sort_key))
+
     target_group_by_kind = {
-        "spawned_object": "Logic: spawned",
-        "spawned_weapon": "Logic: spawned",
         "door": "Logic: doors",
         "backdoor": "Logic: backdoors",
         "backdoor_destination": "Logic: backdoors",
         "backdoor_world": "Logic: backdoors",
-        "destructable_object": "Logic: destructibles",
-        "spawned_destructable_object": "Logic: destructibles",
-        "destroy_type4_unresolved": "Logic: destructibles",
-        "destroy_type4_offmap": "Logic: destructibles",
     }
     seen_targets: set[tuple[str, int | None, int, int, str]] = set()
     for point in graph.unique_points():

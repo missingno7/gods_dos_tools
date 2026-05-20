@@ -276,11 +276,11 @@ def _nearest_destructable_item_point(graph: "LogicGraph", puzzle: MapPuzzle) -> 
     pretty = full_name if full_name != "—" else "type-4 object"
     if source_kind == "map_item":
         return (
-            LogicPoint(target_x, target_y, f"DEO{source_index}", "destructable_object", source_index),
+            LogicPoint(target_x, target_y, f"I{source_index}", "destructable_object", source_index),
             f"destroys destructable map item I{source_index} ({pretty})",
         )
     return (
-        LogicPoint(target_x, target_y, f"SDEO{source_index}", "spawned_destructable_object", source_index),
+        LogicPoint(target_x, target_y, f"P{source_index}/SPO", "spawned_destructable_object", source_index),
         f"destroys spawned destructable object from P{source_index} ({pretty})",
     )
 

@@ -43,6 +43,27 @@ def dcl_unpack(data: bytes) -> bytes:
         raise GodsCompressionError(f"PKWARE DCL unpack failed: {exc}") from exc
 
 
+def dcl_pack(data: bytes) -> bytes:
+    """Pack a GODS `P*` resource as a raw PKWARE DCL implode stream."""
+    if dclimplode is None:  # pragma: no cover - depends on environment
+        raise GodsCompressionError(
+            "Missing dependency `dclimplode`. Install requirements.txt first."
+        ) from _DCL_IMPORT_ERROR
+
+    try:
+        if hasattr(dclimplode, "compress"):
+            return dclimplode.compress(data)
+        if hasattr(dclimplode, "compressobj"):
+            obj = dclimplode.compressobj()
+            packed = obj.compress(data)
+            if hasattr(obj, "flush"):
+                packed += obj.flush()
+            return packed
+    except Exception as exc:  # pragma: no cover - library-specific error type
+        raise GodsCompressionError(f"PKWARE DCL pack failed: {exc}") from exc
+    raise GodsCompressionError("Installed `dclimplode` does not expose compression support.")
+
+
 def load_packed(path: str | Path) -> PackedResource:
     path = Path(path)
     packed = path.read_bytes()
@@ -53,3 +74,8 @@ def load_packed(path: str | Path) -> PackedResource:
         unpacked_size=len(unpacked),
         data=unpacked,
     )
+
+
+def save_packed(path: str | Path, payload: bytes) -> None:
+    path = Path(path)
+    path.write_bytes(dcl_pack(payload))

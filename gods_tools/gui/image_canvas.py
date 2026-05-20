@@ -70,6 +70,9 @@ class ImageCanvas(ttk.Frame):
     def set_hover_callback(self, callback) -> None:
         self._hover_callback = callback
 
+    def set_cursor(self, cursor: str) -> None:
+        self.canvas.configure(cursor=cursor)
+
     def set_overlay(self, overlay: CanvasOverlay | None) -> None:
         self._overlay = overlay
         self._redraw()

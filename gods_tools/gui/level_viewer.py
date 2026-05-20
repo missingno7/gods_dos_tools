@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
+from PIL import Image, ImageTk
 
-from gods_tools.formats.compression import GodsCompressionError
-from gods_tools.formats.alfils import AlfilsData, AlfilsFormatError, load_packed_alfils
+from gods_tools.formats.compression import GodsCompressionError, dcl_pack
+from gods_tools.formats.alfils import AlfilsData, AlfilsFormatError, EVENT_TYPE_NAMES, parse_alfils_payload, load_packed_alfils
 from gods_tools.formats.flying_paths import FlyingPathsData, FlyingPathsFormatError, load_packed_flying_paths
-from gods_tools.formats.enemy_info import EnemyInfo, get_enemy_info
+from gods_tools.formats.enemy_info import EnemyInfo, get_enemy_info, iter_enemy_infos
 from gods_tools.formats.logic import LogicGraph, LogicPoint, build_logic_graph, condition_type_name, puzzle_effect_name
 from gods_tools.formats.mechanisms import (
     describe_component,
@@ -30,7 +31,7 @@ from gods_tools.formats.item_tables import (
     load_packed_weapon_table,
 )
 from gods_tools.render.sprites import SpriteBank, load_level_sprite_bank
-from gods_tools.formats.map import GodsMap, MapFormatError, MAP_CELL_HEIGHT, MAP_CELL_WIDTH, load_packed_map
+from gods_tools.formats.map import GodsMap, MapFormatError, MAP_CELL_HEIGHT, MAP_CELL_WIDTH, parse_map_payload, load_packed_map
 from gods_tools.formats.diagnostics import LevelDiagnostics, build_level_diagnostics
 from gods_tools.render.levels import LevelRenderOptions, LevelRenderResult, render_level_map
 from gods_tools.model.document import LevelDocument
@@ -64,6 +65,22 @@ class PropertyRow:
 class ConditionParamPresentation:
     summary: str
     rows: tuple[PropertyRow, ...] = ()
+
+
+@dataclass(frozen=True)
+class PropertyEditSpec:
+    field: str
+    ref: tuple[str, object]
+    choices: tuple[str, ...] = ()
+    pick: bool = False
+    atlas: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingPropertyEdit:
+    spec: PropertyEditSpec
+    value: str
+    label: str
 
 
 @dataclass
@@ -133,6 +150,14 @@ class LevelViewer(ttk.Frame):
         self.entity_refs: dict[str, tuple[str, object]] = {}
         self.context_refs: dict[str, tuple[str, object]] = {}
         self.entity_rows_by_ref: dict[tuple[str, object], tuple[str, str, str, str]] = {}
+        self.edit_ref: tuple[str, object] | None = None
+        self.edit_vars: dict[str, tk.StringVar] = {}
+        self.property_edit_specs: dict[str, PropertyEditSpec] = {}
+        self.pending_pick: PropertyEditSpec | None = None
+        self.pending_property_edits: list[PendingPropertyEdit] = []
+        self.pending_edit_count_var = tk.StringVar(value="No pending edits")
+        self.has_unsaved_changes = False
+        self.suppress_next_map_double_click = False
         self.entity_trees: dict[str, ttk.Treeview] = {}
         self.entity_group_frames: dict[str, ttk.Frame] = {}
         self.entity_group_buttons: dict[str, ttk.Button] = {}
@@ -215,6 +240,12 @@ class LevelViewer(ttk.Frame):
 
         entity_frame = ttk.Frame(browse_pane)
         browse_pane.add(entity_frame, weight=3)
+        entity_actions = ttk.Frame(entity_frame)
+        entity_actions.pack(fill=tk.X, pady=(0, 4))
+        self.entity_add_button = ttk.Button(entity_actions, text="Add", command=self._on_entity_add)
+        self.entity_add_button.pack(side=tk.LEFT)
+        self.entity_add_hint_var = tk.StringVar(value="")
+        ttk.Label(entity_actions, textvariable=self.entity_add_hint_var, foreground="#666666").pack(side=tk.LEFT, padx=(6, 0))
         self.entity_group_bar = ttk.Frame(entity_frame)
         self.entity_group_bar.pack(fill=tk.X, pady=(0, 4))
         self.entity_group_bar.bind("<Configure>", lambda _event: self._layout_entity_group_buttons())
@@ -239,11 +270,24 @@ class LevelViewer(ttk.Frame):
         self.property_tree.heading("value", text="Value")
         self.property_tree.column("#0", width=130, stretch=False)
         self.property_tree.column("value", width=220, stretch=True)
+        self.property_tree.tag_configure("pending_changed", foreground="#a86500")
+        self.property_tree.tag_configure("pending_delete", foreground="#b00020")
+        self.property_tree.tag_configure("pending_new", foreground="#007a3d")
         self.browser_property_tree = self.property_tree
         prop_scroll = ttk.Scrollbar(property_frame, orient=tk.VERTICAL, command=self.property_tree.yview)
         self.property_tree.configure(yscrollcommand=prop_scroll.set)
+        property_actions = ttk.Frame(property_frame)
+        property_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Label(property_actions, textvariable=self.pending_edit_count_var).pack(side=tk.LEFT)
+        ttk.Button(property_actions, text="Apply", command=self.apply_pending_property_edits).pack(side=tk.RIGHT)
+        ttk.Button(property_actions, text="Clear", command=self.clear_pending_property_edits).pack(side=tk.RIGHT, padx=(0, 4))
         self.property_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.property_tree.bind("<Double-Button-1>", self._on_property_activated)
+        self.property_tree.bind("<Delete>", self._on_property_delete)
         prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.edit_frame = ttk.LabelFrame(property_frame, text="Edit", padding=4)
+        self.edit_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self.edit_frame.pack_forget()
 
         ttk.Label(context_tab, text="Selection context", font=("", 11, "bold")).pack(anchor="w", pady=(0, 4))
         context_pane = ttk.PanedWindow(context_tab, orient=tk.VERTICAL)
@@ -629,6 +673,8 @@ class LevelViewer(ttk.Frame):
             self.selected_logic_point = None
             self.selected_enemy_wave = None
             self.selected_map_item = None
+            self.clear_pending_property_edits()
+            self.has_unsaved_changes = False
             render_result = render_level_map(
                 map_data,
                 resource,
@@ -672,7 +718,7 @@ class LevelViewer(ttk.Frame):
             edit_session=EditSession(document),
             render_result=render_result,
         )
-        self.map_canvas.set_image(render_result.image)
+        self.map_canvas.set_image(self._render_image_with_pending_previews(render_result.image))
         self.map_canvas.set_overlay(render_result.canvas_overlay)
         self._populate_entity_tree()
         self._populate_puzzle_tree()
@@ -718,15 +764,25 @@ class LevelViewer(ttk.Frame):
     def _wave_reward_text(self, wave) -> str:
         if wave is None or not wave.has_reward or wave.reward_info_index is None:
             return "none"
-        if wave.reward_kind == "object":
-            info = self.loaded.object_table.get(wave.reward_info_index) if self.loaded is not None and self.loaded.object_table is not None else None
-            name = info.full_name if info is not None else f"object {wave.reward_info_index}"
-            return f"object #{wave.reward_info_index}: {name}"
-        if wave.reward_kind == "weapon":
-            info = self.loaded.weapon_table.get(wave.reward_info_index) if self.loaded is not None and self.loaded.weapon_table is not None else None
-            name = info.full_name if info is not None else f"weapon {wave.reward_info_index}"
-            return f"weapon #{wave.reward_info_index}: {name}"
-        return "unknown"
+        return self._reward_text_from_kind_and_index(wave.reward_kind, wave.reward_info_index, raw_value=wave.reward)
+
+    def _walking_wave_reward_text_from_raw(self, reward: int) -> str:
+        if reward == 0xFF:
+            return "none"
+        if reward <= 10:
+            return self._reward_text_from_kind_and_index("weapon", reward, raw_value=reward)
+        return self._reward_text_from_kind_and_index("object", reward - 11, raw_value=reward)
+
+    def _reward_text_from_kind_and_index(self, kind: str | None, index: int, *, raw_value: int) -> str:
+        if kind == "object":
+            info = self.loaded.object_table.get(index) if self.loaded is not None and self.loaded.object_table is not None else None
+            name = info.full_name if info is not None else f"object {index}"
+            return f"object #{index}: {name}"
+        if kind == "weapon":
+            info = self.loaded.weapon_table.get(index) if self.loaded is not None and self.loaded.weapon_table is not None else None
+            name = info.full_name if info is not None else f"weapon {index}"
+            return f"weapon #{index}: {name}"
+        return f"raw {raw_value}"
 
     def _reward_suffix(self, wave) -> str:
         text = self._wave_reward_text(wave)
@@ -1581,12 +1637,16 @@ class LevelViewer(ttk.Frame):
         tree.column("detail", width=185, stretch=True)
         tree.column("pos", width=66, stretch=False)
         tree.tag_configure("related", font=self.entity_related_font)
+        tree.tag_configure("pending_changed", foreground="#a86500")
+        tree.tag_configure("pending_delete", foreground="#b00020")
+        tree.tag_configure("pending_new", foreground="#007a3d")
         scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         tree.bind("<<TreeviewSelect>>", self._on_browser_entity_selected)
         tree.bind("<Double-Button-1>", self._on_entity_selected)
+        tree.bind("<Delete>", self._on_browser_entity_delete)
         self.entity_group_frames[label] = frame
         self.entity_group_buttons[label] = button
         self.entity_trees[label] = tree
@@ -1617,6 +1677,30 @@ class LevelViewer(ttk.Frame):
             other.pack_forget()
         frame.pack(fill=tk.BOTH, expand=True)
         self.selected_entity_group = label
+        self._update_entity_add_button()
+
+    def _update_entity_add_button(self) -> None:
+        if not hasattr(self, "entity_add_button"):
+            return
+        group = self.selected_entity_group or ""
+        if group == "Map items":
+            self.entity_add_button.configure(text="Add item", state=tk.NORMAL)
+            self.entity_add_hint_var.set("object/weapon atlas, then pick map")
+        elif group == "Events":
+            self.entity_add_button.configure(text="Add event", state=tk.NORMAL)
+            self.entity_add_hint_var.set("choose type/param, then add trigger cells")
+        else:
+            self.entity_add_button.configure(text="Add", state=tk.DISABLED)
+            self.entity_add_hint_var.set("add is not wired for this category yet")
+
+    def _on_entity_add(self) -> None:
+        group = self.selected_entity_group or ""
+        if group == "Map items":
+            self._ask_add_map_item()
+        elif group == "Events":
+            self._ask_add_event()
+        else:
+            self.inspect_var.set("Add is not wired for this category yet.")
 
     def _insert_entity(
         self,
@@ -1631,11 +1715,32 @@ class LevelViewer(ttk.Frame):
         if tree is None:
             return
         iid = f"entity:{len(self.entity_refs)}"
-        tree.insert("", tk.END, iid=iid, text=label, values=(detail, position))
         ref = (ref_kind, ref_value)
+        pending_tag = self._pending_tag_for_ref(ref)
+        tags = (pending_tag,) if pending_tag is not None else ()
+        tree.insert("", tk.END, iid=iid, text=label, values=(detail, position), tags=tags)
         self.entity_refs[iid] = ref
         group = next((name for name, candidate in self.entity_trees.items() if candidate is tree), "")
         self.entity_rows_by_ref.setdefault(ref, (label, group, detail, position))
+
+    def _pending_tag_for_ref(self, ref: tuple[str, object]) -> str | None:
+        ref_kind, ref_value = ref
+        for edit in reversed(self.pending_property_edits):
+            edit_kind, edit_value = edit.spec.ref
+            if ref_kind == "event" and edit_kind == "event" and int(ref_value) == int(edit_value):
+                if edit.spec.field == "event_delete":
+                    return "pending_delete"
+                return "pending_new" if edit.spec.field == "event_create" else "pending_changed"
+            if ref_kind == "item" and edit_kind == "item" and isinstance(ref_value, MapItemSelection) and isinstance(edit_value, MapItemSelection):
+                if ref_value.item_index == edit_value.item_index:
+                    return "pending_changed"
+            if ref_kind == "wave" and edit_kind == "wave" and isinstance(ref_value, EnemySelection) and isinstance(edit_value, EnemySelection):
+                if ref_value.category == edit_value.category and ref_value.wave_index == edit_value.wave_index:
+                    return "pending_changed"
+            if ref_kind == "point" and edit_kind == "point" and isinstance(ref_value, LogicPoint) and isinstance(edit_value, LogicPoint):
+                if ref_value.kind == edit_value.kind and ref_value.index == edit_value.index:
+                    return "pending_changed"
+        return None
 
     @staticmethod
     def _position_text(x: int | None, y: int | None) -> str:
@@ -1671,9 +1776,12 @@ class LevelViewer(ttk.Frame):
     def _update_entity_properties(self) -> None:
         if not hasattr(self, "property_tree"):
             return
+        is_browser_properties = getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None)
         self.property_tree.delete(*self.property_tree.get_children())
-        if getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+        if is_browser_properties:
             self._set_flying_path_preview(None)
+            self._clear_edit_controls()
+            self.property_edit_specs.clear()
         if self.loaded is None:
             return
         if self.selected_event_index is not None:
@@ -1691,6 +1799,21 @@ class LevelViewer(ttk.Frame):
             self._insert_flying_path_properties(self.selected_flying_path_index)
         else:
             self.property_tree.insert("", tk.END, text="Selection", values=("None",))
+        if is_browser_properties:
+            self._clear_edit_controls()
+
+    def _ref_for_current_properties_selection(self) -> tuple[str, object] | None:
+        if self.selected_map_item is not None:
+            return ("item", self.selected_map_item)
+        if self.selected_enemy_wave is not None:
+            return ("wave", self.selected_enemy_wave)
+        if self.selected_logic_point is not None:
+            return ("point", self.selected_logic_point)
+        if self.selected_event_index is not None:
+            return ("event", self.selected_event_index)
+        if self.selected_flying_path_index is not None:
+            return ("path", self.selected_flying_path_index)
+        return None
 
     def _selection_snapshot(self) -> tuple[int | None, int | None, LogicPoint | None, EnemySelection | None, MapItemSelection | None]:
         return (
@@ -1727,9 +1850,956 @@ class LevelViewer(ttk.Frame):
         elif ref_kind == "item":
             assert isinstance(value, MapItemSelection)
             self.selected_map_item = value
+        elif ref_kind == "item_raw":
+            return
         else:
             assert isinstance(value, LogicPoint)
             self.selected_logic_point = value
+
+    def _clear_edit_controls(self) -> None:
+        if not hasattr(self, "edit_frame"):
+            return
+        for child in self.edit_frame.winfo_children():
+            child.destroy()
+        self.edit_vars.clear()
+        self.edit_ref = None
+        self.edit_frame.pack_forget()
+
+    def _add_edit_entry(self, row: int, key: str, label: str, value: object) -> None:
+        assert hasattr(self, "edit_frame")
+        ttk.Label(self.edit_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 4), pady=1)
+        var = tk.StringVar(value=str(value))
+        self.edit_vars[key] = var
+        ttk.Entry(self.edit_frame, textvariable=var, width=22).grid(row=row, column=1, sticky="ew", pady=1)
+
+    def _add_edit_combo(self, row: int, key: str, label: str, value: object, values: list[str]) -> None:
+        assert hasattr(self, "edit_frame")
+        ttk.Label(self.edit_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 4), pady=1)
+        var = tk.StringVar(value=str(value))
+        self.edit_vars[key] = var
+        ttk.Combobox(self.edit_frame, textvariable=var, values=values, state="readonly", width=24).grid(row=row, column=1, sticky="ew", pady=1)
+
+    @staticmethod
+    def _choice_index(value: str) -> int:
+        return int(value.split(":", 1)[0])
+
+    @staticmethod
+    def _parse_cells(text: str) -> tuple[tuple[int, int], ...]:
+        cells: list[tuple[int, int]] = []
+        for chunk in text.replace(";", " ").split():
+            x_text, y_text = chunk.split(",", 1)
+            cells.append((int(x_text), int(y_text)))
+        return tuple(cells)
+
+    def _update_edit_controls_for_ref(self, ref: tuple[str, object] | None) -> None:
+        self._clear_edit_controls()
+        if ref is None or self.loaded is None or not hasattr(self, "edit_frame"):
+            return
+        ref_kind, value = ref
+        self.edit_ref = ref
+        self.edit_frame.pack(fill=tk.X, pady=(4, 0))
+        self.edit_frame.columnconfigure(1, weight=1)
+        row = 0
+        if ref_kind == "event":
+            event_index = int(value)
+            event = self.loaded.alfils_data.event(event_index) if self.loaded.alfils_data is not None else None
+            if event is None:
+                event = self.loaded.alfils_data.events[event_index] if self.loaded.alfils_data is not None and 0 <= event_index < len(self.loaded.alfils_data.events) else None
+            if event is None:
+                self._clear_edit_controls()
+                return
+            type_values = ["-1: Unused", *[f"{index}: {name}" for index, name in sorted(EVENT_TYPE_NAMES.items())]]
+            self._add_edit_combo(row, "event_type", "Type", f"{event.event_type_index if event.event_type_index is not None else -1}: {event.type_name}", type_values)
+            row += 1
+            self._add_edit_entry(row, "event_param", "Param", event.param)
+            row += 1
+            cells = self.loaded.logic_graph.event_cells.get(event_index, ()) if self.loaded.logic_graph is not None else ()
+            self._add_edit_entry(row, "event_cells", "Map triggers", "; ".join(f"{x},{y}" for x, y in cells))
+            row += 1
+        elif ref_kind == "item":
+            selection = value
+            assert isinstance(selection, MapItemSelection)
+            item = self.loaded.map_data.items[selection.item_index]
+            self._add_edit_entry(row, "item_x", "X", item.pixel_x)
+            row += 1
+            self._add_edit_entry(row, "item_y", "Y", item.pixel_y)
+            row += 1
+            self._add_edit_entry(row, "item_raw_id", "Object/weapon id", item.object_or_weapon_info_index)
+            row += 1
+        elif ref_kind == "point":
+            point = value
+            assert isinstance(point, LogicPoint)
+            if point.kind != "puzzle" or point.index is None:
+                self._clear_edit_controls()
+                return
+            puzzle = self.loaded.map_data.puzzles[point.index]
+            effect_values = [f"{index}: {puzzle_effect_name(index)}" for index in range(15)]
+            condition_values = [f"{index}: {condition_type_name(index)}" for index in range(17)]
+            self._add_edit_entry(row, "puzzle_x", "X", puzzle.pixel_x)
+            row += 1
+            self._add_edit_entry(row, "puzzle_y", "Y", puzzle.pixel_y)
+            row += 1
+            self._add_edit_combo(row, "puzzle_effect_type", "Effect type", f"{puzzle.effect_function_index}: {puzzle_effect_name(puzzle.effect_function_index)}", effect_values)
+            row += 1
+            self._add_edit_entry(row, "puzzle_effect_param", "Effect param", puzzle.effect_param)
+            row += 1
+            self._add_edit_combo(row, "puzzle_remove", "Remove after", str(int(puzzle.remove_after_effect)), ["0", "1"])
+            row += 1
+            for slot in range(3):
+                cond_type = puzzle.condition_function_indices[slot]
+                self._add_edit_combo(row, f"cond{slot}_type", f"Cond {slot} type", f"{cond_type}: {condition_type_name(cond_type)}", condition_values)
+                row += 1
+                self._add_edit_entry(row, f"cond{slot}_param", f"Cond {slot} param", puzzle.condition_params[slot])
+                row += 1
+        else:
+            self._clear_edit_controls()
+            return
+        ttk.Button(self.edit_frame, text="Apply", command=self._apply_edit_controls).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+    def _apply_edit_controls(self) -> None:
+        if self.loaded is None or self.edit_ref is None:
+            return
+        ref_kind, value = self.edit_ref
+        try:
+            session = EditSession(self.loaded.document)
+            if ref_kind == "event":
+                event_index = int(value)
+                session = session.plan_set_event(
+                    event_index,
+                    event_type_index=self._choice_index(self.edit_vars["event_type"].get()),
+                    param=int(self.edit_vars["event_param"].get()),
+                )
+                session = session.plan_set_event_trigger_cells(event_index, self._parse_cells(self.edit_vars["event_cells"].get()))
+            elif ref_kind == "item":
+                selection = value
+                assert isinstance(selection, MapItemSelection)
+                session = session.plan_set_map_item(
+                    selection.item_index,
+                    pixel_x=int(self.edit_vars["item_x"].get()),
+                    pixel_y=int(self.edit_vars["item_y"].get()),
+                    raw_id=int(self.edit_vars["item_raw_id"].get()),
+                )
+            elif ref_kind == "point":
+                point = value
+                assert isinstance(point, LogicPoint)
+                if point.kind != "puzzle" or point.index is None:
+                    return
+                session = session.plan_set_puzzle(
+                    point.index,
+                    condition_types=tuple(self._choice_index(self.edit_vars[f"cond{slot}_type"].get()) for slot in range(3)),  # type: ignore[arg-type]
+                    condition_params=tuple(int(self.edit_vars[f"cond{slot}_param"].get()) for slot in range(3)),  # type: ignore[arg-type]
+                    pixel_x=int(self.edit_vars["puzzle_x"].get()),
+                    pixel_y=int(self.edit_vars["puzzle_y"].get()),
+                    effect_type=self._choice_index(self.edit_vars["puzzle_effect_type"].get()),
+                    effect_param=int(self.edit_vars["puzzle_effect_param"].get()),
+                    remove_after_effect=bool(int(self.edit_vars["puzzle_remove"].get())),
+                )
+            else:
+                return
+            self._apply_edit_session(session)
+        except (AssertionError, KeyError, ValueError, IndexError, TypeError) as exc:
+            messagebox.showerror("GODS entity editor", f"Could not apply edit.\n\n{exc}")
+
+    def _apply_edit_session(self, session: EditSession) -> None:
+        assert self.loaded is not None
+        document = self.loaded.document
+        try:
+            map_payload = session.preview_patched_map_payload()
+            alfils_payload = session.plan.apply_to_payload("alfils", document.alfils_data.raw_payload) if document.alfils_data is not None else None
+            map_data = parse_map_payload(map_payload, document.map_data.source_path, document.map_data.packed_size)
+            alfils_data = (
+                parse_alfils_payload(alfils_payload, document.alfils_data.source_path, document.alfils_data.packed_size)
+                if alfils_payload is not None and document.alfils_data is not None
+                else document.alfils_data
+            )
+            logic_graph = build_logic_graph(map_data, alfils_data, document.object_table, document.weapon_table) if alfils_data is not None else None
+            diagnostics = build_level_diagnostics(map_data, alfils_data, logic_graph) if alfils_data is not None and logic_graph is not None else None
+            new_document = LevelDocument(
+                resource=document.resource,
+                map_data=map_data,
+                alfils_data=alfils_data,
+                object_table=document.object_table,
+                weapon_table=document.weapon_table,
+                sprite_bank=document.sprite_bank,
+                flying_paths=document.flying_paths,
+                logic_graph=logic_graph,
+                diagnostics=diagnostics,
+            )
+            render_result = render_level_map(
+                map_data,
+                document.resource,
+                self._build_render_options(),
+                alfils_data,
+                document.object_table,
+                document.weapon_table,
+                document.sprite_bank,
+                flying_paths=document.flying_paths,
+            )
+            self.loaded = LoadedLevel(
+                document=new_document,
+                entity_index=build_entity_index(new_document),
+                edit_session=session,
+                render_result=render_result,
+            )
+            if self.selected_logic_point is not None and self.selected_logic_point.kind == "puzzle" and self.selected_logic_point.index is not None and logic_graph is not None:
+                self.selected_logic_point = logic_graph.point_for_puzzle(self.selected_logic_point.index) or self.selected_logic_point
+        except Exception as exc:
+            messagebox.showerror("GODS entity editor", f"Could not rebuild edited level.\n\n{exc}")
+            return
+        self.map_canvas.set_image(self._render_image_with_pending_previews(self.loaded.render_result.image))
+        self.map_canvas.set_overlay(self.loaded.render_result.canvas_overlay)
+        self._populate_entity_tree()
+        self._populate_puzzle_tree()
+        self._update_info()
+        self._update_logic_text()
+        self._update_edit_prep_text()
+        self._update_raw_text()
+        self._update_entity_properties()
+        self.has_unsaved_changes = True
+        self.inspect_var.set(f"Applied {session.patch_count} in-memory edit patch(es).")
+
+    def _on_property_activated(self, event: tk.Event) -> None:
+        if event.widget is not getattr(self, "browser_property_tree", None):
+            return
+        item_id = self.property_tree.identify_row(event.y)
+        spec = self.property_edit_specs.get(item_id)
+        if spec is None:
+            return
+        current = self.property_tree.set(item_id, "value")
+        if spec.field in {"pending_event_type", "pending_event_param"}:
+            value = self._ask_choice("Edit property", self.property_tree.item(item_id, "text"), current, spec.choices) if spec.choices else simpledialog.askstring("Edit property", self.property_tree.item(item_id, "text"), initialvalue=current, parent=self)
+            if value is not None:
+                self._update_pending_event_edit(spec, value, item_id)
+            return
+        if spec.pick:
+            self._set_pick_mode(spec)
+            return
+        if spec.atlas is not None:
+            value = self._ask_atlas_value(spec.atlas, current)
+        elif spec.choices:
+            value = self._ask_choice("Edit property", self.property_tree.item(item_id, "text"), current, spec.choices)
+        else:
+            value = simpledialog.askstring("Edit property", self.property_tree.item(item_id, "text"), initialvalue=current, parent=self)
+        if value is None:
+            return
+        self._queue_property_edit(spec, value, item_id)
+
+    def _ask_add_map_item(self) -> None:
+        choice = self._ask_choice("Add map item", "Kind", "object", ("object", "weapon"))
+        if choice is None:
+            return
+        atlas = "object" if choice == "object" else "weapon_raw"
+        value = self._ask_atlas_value(atlas, "")
+        if value is None:
+            return
+        self._set_pick_mode(PropertyEditSpec("item_create", ("item_raw", int(value)), pick=True))
+        self.inspect_var.set("Pick mode: click the map to place the new item.")
+
+    def _ask_add_event(self) -> None:
+        if self.loaded is None or self.loaded.alfils_data is None:
+            return
+        empty = next((event for event in self.loaded.alfils_data.events if event.event_type_index == 11), None)
+        if empty is None:
+            messagebox.showinfo("GODS entity editor", "No unused event slot is available.")
+            return
+        self._queue_property_edit(PropertyEditSpec("event_create", ("event", empty.index)), "2,0")
+        self._select_pending_event_row(empty.index)
+        self.inspect_var.set(f"Queued new event E{empty.index}. Select the pending row and edit Type/Param in Properties before Apply.")
+
+    def _set_pick_mode(self, spec: PropertyEditSpec) -> None:
+        self.pending_pick = spec
+        self.map_canvas.set_cursor("crosshair")
+        self.bind("<Escape>", self._cancel_pick_mode)
+        self.inspect_var.set("Pick mode: click the map to set this value. Press Esc to cancel.")
+
+    def _cancel_pick_mode(self, _event: tk.Event | None = None) -> None:
+        self._clear_pick_mode()
+        self.inspect_var.set("Pick cancelled.")
+
+    def _clear_pick_mode(self) -> None:
+        self.pending_pick = None
+        self.map_canvas.set_cursor("")
+        self.unbind("<Escape>")
+
+    def _queue_property_edit(self, spec: PropertyEditSpec, value: str, item_id: str | None = None) -> None:
+        label = self._pending_edit_label(spec, value)
+        self.pending_property_edits.append(PendingPropertyEdit(spec, value, label))
+        self._update_pending_edit_state()
+        if item_id is not None and self.property_tree.exists(item_id):
+            self.property_tree.set(item_id, "value", f"{self._display_value_for_spec(spec, value)} *")
+            self._set_pending_tags(self.property_tree, item_id, "pending_delete" if self._is_delete_edit(spec) else "pending_changed")
+        if spec.field in {"event_delete", "event_create", "item_create"}:
+            self._populate_entity_tree()
+        else:
+            self._refresh_pending_marks()
+        self._update_pending_preview_image()
+        self.inspect_var.set(f"Queued edit: {label}. Press Apply to rebuild the level.")
+
+    def _pending_event_create_edit_index(self, event_index: int) -> int | None:
+        for index, edit in enumerate(self.pending_property_edits):
+            if edit.spec.field == "event_create" and int(edit.spec.ref[1]) == event_index:
+                return index
+        return None
+
+    def _pending_event_create_state(self, event_index: int) -> tuple[int, int] | None:
+        edit_index = self._pending_event_create_edit_index(event_index)
+        if edit_index is None:
+            return None
+        type_text, param_text = self.pending_property_edits[edit_index].value.split(",", 1)
+        return int(type_text), int(param_text)
+
+    def _replace_pending_event_create_state(self, event_index: int, event_type: int, param: int) -> None:
+        edit_index = self._pending_event_create_edit_index(event_index)
+        if edit_index is None:
+            return
+        edit = self.pending_property_edits[edit_index]
+        new_value = f"{event_type},{param}"
+        self.pending_property_edits[edit_index] = PendingPropertyEdit(
+            edit.spec,
+            new_value,
+            self._pending_edit_label(edit.spec, new_value),
+        )
+
+    def _update_pending_event_edit(self, spec: PropertyEditSpec, value: str, item_id: str | None = None) -> None:
+        if spec.ref[0] != "pending_event":
+            return
+        event_index = int(spec.ref[1])
+        state = self._pending_event_create_state(event_index)
+        if state is None:
+            return
+
+        event_type, param = state
+        if spec.field == "pending_event_type":
+            event_type = self._choice_index(value)
+            param = self._normalise_event_param_for_type(event_type, param)
+        elif spec.field == "pending_event_param":
+            param = self._parse_event_param_value(event_type, value)
+        else:
+            return
+
+        self._replace_pending_event_create_state(event_index, event_type, param)
+        self._populate_entity_tree()
+
+        # Rebuild the selected pending-event property panel from the canonical queued
+        # event_create edit.  Updating only the clicked Treeview row used to write the
+        # derived "spawn WW0"/"check P0" effect text into the Type cell and left the
+        # context-dependent Param row stale after a type switch.
+        self._select_pending_event_row(event_index)
+
+        self._update_pending_edit_state()
+        self._update_pending_preview_image()
+        self.inspect_var.set(f"Updated pending event E{event_index}. Press Apply to create it.")
+
+    def _parse_event_param_value(self, event_type: int, value: str) -> int:
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+        upper = text.upper()
+        prefixes = {
+            0: "FW",
+            1: "WW",
+            2: "P",
+            3: "IW",
+            4: "IF",
+            6: "MB",
+            7: "MB",
+            8: "MB",
+            9: "MB",
+            10: "G",
+        }
+        prefix = prefixes.get(event_type)
+        if prefix is not None and upper.startswith(prefix):
+            return self._leading_integer(upper[len(prefix):])
+        return self._leading_integer(text)
+
+    @staticmethod
+    def _is_delete_edit(spec: PropertyEditSpec) -> bool:
+        return spec.field == "event_delete" or spec.field.startswith("event_delete_cell:")
+
+    def _pending_edit_label(self, spec: PropertyEditSpec, value: str) -> str:
+        ref_kind, ref_value = spec.ref
+        if ref_kind == "event":
+            if spec.field == "event_create":
+                return f"new E{int(ref_value)} = {self._display_value_for_spec(spec, value)}"
+            return f"E{int(ref_value)} {spec.field} = {self._display_value_for_spec(spec, value)}"
+        if ref_kind == "item_raw":
+            return f"new item = {self._display_value_for_spec(spec, value)}"
+        if ref_kind == "item" and isinstance(ref_value, MapItemSelection):
+            return f"I{ref_value.item_index} {spec.field} = {self._display_value_for_spec(spec, value)}"
+        if ref_kind == "wave" and isinstance(ref_value, EnemySelection):
+            return f"{ref_value.category}{ref_value.wave_index} {spec.field} = {self._display_value_for_spec(spec, value)}"
+        if ref_kind == "point" and isinstance(ref_value, LogicPoint):
+            return f"{ref_value.label} {spec.field} = {self._display_value_for_spec(spec, value)}"
+        return f"{spec.field} = {self._display_value_for_spec(spec, value)}"
+
+    def _display_value_for_spec(self, spec: PropertyEditSpec, value: str) -> str:
+        if spec.atlas == "object":
+            return self._object_ref(int(value))
+        if spec.atlas == "weapon":
+            return self._weapon_ref(int(value))
+        if spec.atlas == "weapon_raw":
+            return self._weapon_ref(int(value) - 192)
+        if spec.atlas == "walking_wave_reward":
+            return self._walking_wave_reward_text_from_raw(int(value))
+        if spec.atlas is not None and spec.atlas.startswith("enemy_"):
+            kind = spec.atlas.split("_", 1)[1]
+            info = get_enemy_info(self.loaded.resource.level, kind, int(value)) if self.loaded is not None else None
+            return f"EN{value}: {info.display_name if info is not None else 'enemy'}"
+        if spec.field == "item_create":
+            raw_text, x_text, y_text = value.split(",", 2)
+            raw_id = int(raw_text)
+            item_name = self._weapon_ref(raw_id - 192) if raw_id >= 192 else self._object_ref(raw_id)
+            return f"{item_name} at {x_text},{y_text}"
+        if spec.field == "event_create":
+            type_text, param_text = value.split(",", 1)
+            event_type = int(type_text)
+            return self._event_action_text_from_values(event_type, int(param_text))
+        if spec.field == "event_delete":
+            return "delete event"
+        if spec.field.startswith("event_delete_cell:"):
+            return "delete cell"
+        return value
+
+    def _event_action_text_from_values(self, event_type: int | None, param: int) -> str:
+        if self.loaded is not None and self.loaded.alfils_data is not None:
+            class _EventPreview:
+                index = -1
+
+            preview = _EventPreview()
+            preview.event_type_index = event_type
+            preview.param = param
+            preview.type_name = EVENT_TYPE_NAMES.get(event_type, f"Unknown{event_type}") if event_type is not None else "Unused"
+
+            return self._event_action_text(preview)
+        if event_type == 2:
+            return f"check P{param}"
+        return f"{EVENT_TYPE_NAMES.get(event_type, f'Type {event_type}')} param={param}"
+
+    def _on_property_delete(self, _event: tk.Event) -> str:
+        item_ids = self.property_tree.selection()
+        if not item_ids:
+            return "break"
+        spec = self.property_edit_specs.get(item_ids[0])
+        if spec is None:
+            return "break"
+        if spec.field.startswith("event_cell:"):
+            index = spec.field.split(":", 1)[1]
+            self._queue_property_edit(PropertyEditSpec(f"event_delete_cell:{index}", spec.ref), "", item_ids[0])
+        elif spec.field == "event_add_cell":
+            self.inspect_var.set("Add cell is only a command row; nothing to delete.")
+        else:
+            self.inspect_var.set("Delete is only available for removable collection rows here.")
+        return "break"
+
+    def _on_browser_entity_delete(self, event: tk.Event) -> str:
+        tree = event.widget
+        if not isinstance(tree, ttk.Treeview):
+            return "break"
+        item_ids = tree.selection()
+        if not item_ids:
+            return "break"
+        ref = self.entity_refs.get(item_ids[0])
+        if ref is None:
+            return "break"
+        ref_kind, ref_value = ref
+        if ref_kind == "event":
+            self._queue_property_edit(PropertyEditSpec("event_delete", ("event", ref_value)), "")
+        else:
+            self.inspect_var.set("Delete for this entity type is not wired yet.")
+        return "break"
+
+    def _update_pending_edit_state(self) -> None:
+        count = len(self.pending_property_edits)
+        if count == 0:
+            self.pending_edit_count_var.set("No pending edits")
+        elif count == 1:
+            self.pending_edit_count_var.set("1 pending edit")
+        else:
+            self.pending_edit_count_var.set(f"{count} pending edits")
+
+    def clear_pending_property_edits(self) -> None:
+        self.pending_property_edits.clear()
+        self._update_pending_edit_state()
+        self._populate_entity_tree()
+        if self.loaded is not None and getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+            self._update_entity_properties()
+        self._update_pending_preview_image()
+
+    def apply_pending_property_edits(self) -> None:
+        if not self.pending_property_edits:
+            self.inspect_var.set("No pending property edits to apply.")
+            return
+        edits = tuple(self.pending_property_edits)
+        self.pending_property_edits.clear()
+        self._update_pending_edit_state()
+        applied = 0
+        for edit in edits:
+            if self._apply_property_edit(edit.spec, edit.value, show_errors=True):
+                applied += 1
+            else:
+                remaining = edits[applied + 1 :]
+                self.pending_property_edits.extend(remaining)
+                self._update_pending_edit_state()
+                return
+        self.inspect_var.set(f"Applied {applied} pending property edit(s).")
+
+    def save_current_level(self) -> bool:
+        if self.loaded is None:
+            messagebox.showinfo("GODS entity editor", "No level is loaded.")
+            return False
+        if self.pending_property_edits:
+            self.apply_pending_property_edits()
+            if self.pending_property_edits:
+                return False
+        if not self.has_unsaved_changes:
+            self.inspect_var.set("No applied changes to save.")
+            return True
+        document = self.loaded.document
+        try:
+            packed_outputs = [(document.map_data.source_path, dcl_pack(document.map_data.raw_payload))]
+            if document.alfils_data is not None:
+                packed_outputs.append((document.alfils_data.source_path, dcl_pack(document.alfils_data.raw_payload)))
+            for path, packed in packed_outputs:
+                self._backup_once(path)
+                path.write_bytes(packed)
+        except (GodsCompressionError, OSError) as exc:
+            messagebox.showerror("GODS entity editor", f"Could not save level files.\n\n{exc}")
+            return False
+        self.has_unsaved_changes = False
+        self.inspect_var.set(f"Saved {document.resource.map_path.name}" + (" and PALFILS." if document.alfils_data is not None else "."))
+        return True
+
+    @staticmethod
+    def _backup_once(path: Path) -> None:
+        backup = path.with_name(f"{path.name}.bak")
+        if not backup.exists():
+            backup.write_bytes(path.read_bytes())
+
+    def _ask_choice(self, title: str, label: str, current: str, values: tuple[str, ...]) -> str | None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+        result: dict[str, str | None] = {"value": None}
+        ttk.Label(dialog, text=label).pack(anchor="w", padx=8, pady=(8, 2))
+        var = tk.StringVar(value=current if current in values else values[0])
+        combo = ttk.Combobox(dialog, textvariable=var, values=list(values), state="readonly", width=36)
+        combo.pack(fill=tk.X, padx=8, pady=4)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Button(buttons, text="Apply", command=lambda: (result.__setitem__("value", var.get()), dialog.destroy())).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        combo.focus_set()
+        self.wait_window(dialog)
+        return result["value"]
+
+    def _ask_atlas_value(self, atlas: str, current: str) -> str | None:
+        if self.loaded is None:
+            return None
+        records = self._atlas_records(atlas)
+        if not records:
+            messagebox.showinfo("GODS entity editor", "No atlas records are available for this value.")
+            return None
+
+        dialog = tk.Toplevel(self)
+        dialog.title(self._atlas_title(atlas))
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+        result: dict[str, str | None] = {"value": None}
+
+        header = ttk.Frame(dialog)
+        header.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(header, text="Double-click an entry, or select and Apply.").pack(side=tk.LEFT)
+
+        shell = ttk.Frame(dialog)
+        shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        canvas = tk.Canvas(shell, width=620, height=420, background="#202020", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview)
+        grid = ttk.Frame(canvas)
+        grid_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+        grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: (canvas.itemconfigure(grid_window, width=event.width), self._layout_atlas_tiles(grid, event.width)))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        values = {str(edit_value) for edit_value, _title, _subtitle, _sprite in records}
+        current_value = self._atlas_current_value(atlas, current)
+        selected = tk.StringVar(value=current_value if current_value in values else str(records[0][0]))
+        images: list[ImageTk.PhotoImage] = []
+        for ordinal, (edit_value, title, subtitle, sprite) in enumerate(records):
+            tile = ttk.Frame(grid, padding=4)
+            tile.grid(row=0, column=ordinal, sticky="nsew", padx=2, pady=2)
+            if sprite is not None:
+                scale = max(1, min(4, 48 // max(1, max(sprite.size))))
+                preview = sprite.resize((max(1, sprite.width * scale), max(1, sprite.height * scale)), resample=Image.Resampling.NEAREST)
+                image = ImageTk.PhotoImage(preview)
+                images.append(image)
+                image_label = ttk.Label(tile, image=image, anchor="center")
+            else:
+                image_label = ttk.Label(tile, text="no sprite", anchor="center", width=12)
+            image_label.pack(fill=tk.X)
+            ttk.Radiobutton(tile, text=title, value=str(edit_value), variable=selected).pack(anchor="w")
+            ttk.Label(tile, text=subtitle, width=18, wraplength=118).pack(anchor="w")
+            for widget in tile.winfo_children():
+                widget.bind("<Double-Button-1>", lambda _event, value=str(edit_value): (result.__setitem__("value", value), dialog.destroy()))
+                widget.bind("<Button-1>", lambda _event, value=str(edit_value): selected.set(value))
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Button(buttons, text="Apply", command=lambda: (result.__setitem__("value", selected.get()), dialog.destroy())).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"))
+        dialog._atlas_images = images  # type: ignore[attr-defined]
+        self.wait_window(dialog)
+        return result["value"]
+
+    @staticmethod
+    def _layout_atlas_tiles(grid: ttk.Frame, width: int) -> None:
+        children = grid.winfo_children()
+        if not children:
+            return
+        tile_width = 132
+        columns = max(1, width // tile_width)
+        for ordinal, tile in enumerate(children):
+            tile.grid_configure(row=ordinal // columns, column=ordinal % columns)
+
+    def _atlas_records(self, atlas: str) -> list[tuple[int, str, str, object | None]]:
+        if self.loaded is None:
+            return []
+        records: list[tuple[int, str, str, object | None]] = []
+        if atlas == "object" and self.loaded.object_table is not None:
+            for info in self.loaded.object_table.records:
+                sprite = self.loaded.sprite_bank.object_sprite(info.index) if self.loaded.sprite_bank is not None else None
+                records.append((info.index, f"OBJ{info.index}", info.full_name, sprite))
+        elif atlas in {"weapon", "weapon_raw"} and self.loaded.weapon_table is not None:
+            for info in self.loaded.weapon_table.records:
+                edit_value = info.index + 192 if atlas == "weapon_raw" else info.index
+                sprite = self.loaded.sprite_bank.weapon_sprite(info.index) if self.loaded.sprite_bank is not None else None
+                records.append((edit_value, f"WPN{info.index}", info.full_name, sprite))
+        elif atlas == "walking_wave_reward":
+            records.append((0xFF, "None", "No reward", None))
+            if self.loaded.weapon_table is not None:
+                for info in self.loaded.weapon_table.records:
+                    # Walking-wave reward bytes 0..10 encode weapons directly.
+                    if info.index > 10:
+                        continue
+                    sprite = self.loaded.sprite_bank.weapon_sprite(info.index) if self.loaded.sprite_bank is not None else None
+                    records.append((info.index, f"WPN{info.index}", f"Weapon reward: {info.full_name}", sprite))
+            if self.loaded.object_table is not None:
+                for info in self.loaded.object_table.records:
+                    # Object rewards are stored as object_info_index + 11; 0xFF is reserved for None.
+                    raw_reward = info.index + 11
+                    if raw_reward >= 0xFF:
+                        continue
+                    sprite = self.loaded.sprite_bank.object_sprite(info.index) if self.loaded.sprite_bank is not None else None
+                    records.append((raw_reward, f"OBJ{info.index}", f"Object reward: {info.full_name}", sprite))
+        elif atlas.startswith("enemy_"):
+            kind = atlas.split("_", 1)[1]
+            for info in iter_enemy_infos(self.loaded.resource.level, kind):
+                sprite = self.loaded.sprite_bank.sprite(info.sprite_index_for_facing(0)) if self.loaded.sprite_bank is not None else None
+                records.append((info.index, f"EN{info.index}", f"{info.display_name}, {info.action_type}", sprite))
+        return records
+
+    @staticmethod
+    def _atlas_title(atlas: str) -> str:
+        if atlas == "object":
+            return "Object atlas"
+        if atlas in {"weapon", "weapon_raw"}:
+            return "Weapon atlas"
+        if atlas == "walking_wave_reward":
+            return "Enemy-wave reward atlas"
+        if atlas.startswith("enemy_"):
+            return "Enemy atlas"
+        return "Atlas"
+
+    @staticmethod
+    def _atlas_current_value(atlas: str, current: str) -> str:
+        text = current.strip()
+        if text.isdigit():
+            return text
+        if atlas == "object" and text.startswith("OBJ"):
+            return LevelViewer._leading_integer(text[3:])
+        if atlas in {"weapon", "weapon_raw"} and text.startswith("WPN"):
+            index = LevelViewer._leading_integer(text[3:])
+            return str(index + 192 if atlas == "weapon_raw" else index)
+        if atlas == "walking_wave_reward":
+            lower = text.lower()
+            if lower == "none":
+                return str(0xFF)
+            if lower.startswith("weapon #"):
+                return str(LevelViewer._leading_integer(text.split("#", 1)[1]))
+            if lower.startswith("object #"):
+                return str(LevelViewer._leading_integer(text.split("#", 1)[1]) + 11)
+        return text
+
+    @staticmethod
+    def _leading_integer(text: str) -> int:
+        digits = []
+        for char in text.lstrip():
+            if not char.isdigit():
+                break
+            digits.append(char)
+        if not digits:
+            raise ValueError(f"Expected numeric id in {text!r}.")
+        return int("".join(digits))
+
+    def _apply_property_edit(self, spec: PropertyEditSpec, value: str, *, show_errors: bool = False) -> bool:
+        if self.loaded is None:
+            return False
+        ref_kind, ref_value = spec.ref
+        session = EditSession(self.loaded.document)
+        try:
+            if ref_kind == "event":
+                event_index = int(ref_value)
+                event = self.loaded.alfils_data.events[event_index]
+                event_type = event.event_type_index if event.event_type_index is not None else -1
+                param = event.param
+                if spec.field == "event_create":
+                    type_text, param_text = value.split(",", 1)
+                    session = session.plan_set_event(event_index, event_type_index=int(type_text), param=int(param_text))
+                    self._apply_edit_session(session)
+                    return True
+                if spec.field == "event_delete":
+                    session = session.plan_set_event(event_index, event_type_index=11, param=0)
+                    session = session.plan_set_event_trigger_cells(event_index, ())
+                    self._apply_edit_session(session)
+                    return True
+                if spec.field == "event_type":
+                    event_type = self._choice_index(value)
+                elif spec.field == "event_param":
+                    param = self._parse_event_param_value(event_type, value)
+                elif spec.field.startswith("event_cell:"):
+                    cells = list(self.loaded.logic_graph.event_cells.get(event_index, ())) if self.loaded.logic_graph is not None else []
+                    cell_index = int(spec.field.split(":", 1)[1])
+                    if not 0 <= cell_index < len(cells):
+                        raise IndexError(f"Event trigger cell index {cell_index} is out of range.")
+                    cells[cell_index] = self._parse_cell(value)
+                    session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
+                    self._apply_edit_session(session)
+                    return True
+                elif spec.field.startswith("event_delete_cell:"):
+                    cells = list(self.loaded.logic_graph.event_cells.get(event_index, ())) if self.loaded.logic_graph is not None else []
+                    cell_index = int(spec.field.split(":", 1)[1])
+                    if not 0 <= cell_index < len(cells):
+                        raise IndexError(f"Event trigger cell index {cell_index} is out of range.")
+                    del cells[cell_index]
+                    session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
+                    self._apply_edit_session(session)
+                    return True
+                elif spec.field == "event_add_cell":
+                    cells = list(self.loaded.logic_graph.event_cells.get(event_index, ())) if self.loaded.logic_graph is not None else []
+                    cell = self._parse_cell(value)
+                    if cell not in cells:
+                        cells.append(cell)
+                    session = session.plan_set_event_trigger_cells(event_index, tuple(cells))
+                    self._apply_edit_session(session)
+                    return True
+                else:
+                    return False
+                session = session.plan_set_event(event_index, event_type_index=event_type, param=param)
+            elif ref_kind == "item":
+                selection = ref_value
+                assert isinstance(selection, MapItemSelection)
+                item = self.loaded.map_data.items[selection.item_index]
+                x, y, raw_id = item.pixel_x, item.pixel_y, item.object_or_weapon_info_index
+                if spec.field == "item_position":
+                    x, y = self._parse_position(value)
+                elif spec.field == "item_raw_id":
+                    raw_id = int(value)
+                else:
+                    return False
+                session = session.plan_set_map_item(selection.item_index, pixel_x=x, pixel_y=y, raw_id=raw_id)
+                session = self._plan_bound_switch_move(session, item, x, y, raw_id)
+            elif ref_kind == "item_raw":
+                raw_text, x_text, y_text = value.split(",", 2)
+                empty = next((item for item in self.loaded.map_data.items if item.is_empty), None)
+                if empty is None:
+                    raise ValueError("No empty map item slot is available.")
+                session = session.plan_set_map_item(empty.index, pixel_x=int(x_text), pixel_y=int(y_text), raw_id=int(raw_text))
+            elif ref_kind == "wave":
+                selection = ref_value
+                assert isinstance(selection, EnemySelection)
+                if selection.category != "WW":
+                    return False
+                wave = self.loaded.alfils_data.walking_waves[selection.wave_index] if self.loaded.alfils_data is not None else None
+                if wave is None:
+                    return False
+                fields = {
+                    "pixel_x": wave.pixel_x,
+                    "pixel_y": wave.pixel_y,
+                    "facing": wave.facing,
+                    "function_index_unknown": wave.function_index_unknown,
+                    "spawn_delay": wave.spawn_delay,
+                    "enemy_count": wave.enemy_count,
+                    "health": wave.health,
+                    "enemy_info_index": wave.enemy_info_index,
+                    "missile_type": wave.missile_type,
+                    "speed_value": wave.speed_value,
+                    "reward": wave.reward,
+                    "padding": wave.padding,
+                }
+                if spec.field == "wave_position":
+                    fields["pixel_x"], fields["pixel_y"] = self._parse_position(value)
+                elif spec.field == "wave_enemy_info":
+                    fields["enemy_info_index"] = int(value)
+                elif spec.field == "wave_facing":
+                    fields["facing"] = int(value)
+                elif spec.field == "wave_function":
+                    fields["function_index_unknown"] = int(value)
+                elif spec.field == "wave_spawn_delay":
+                    fields["spawn_delay"] = int(value)
+                elif spec.field == "wave_enemy_count":
+                    fields["enemy_count"] = int(value)
+                elif spec.field == "wave_health":
+                    fields["health"] = int(value)
+                elif spec.field == "wave_missile_type":
+                    fields["missile_type"] = int(value)
+                elif spec.field == "wave_speed":
+                    fields["speed_value"] = int(value)
+                elif spec.field == "wave_reward":
+                    fields["reward"] = int(value)
+                else:
+                    return False
+                session = session.plan_set_walking_wave(selection.wave_index, **fields)
+            elif ref_kind == "point":
+                point = ref_value
+                assert isinstance(point, LogicPoint)
+                if point.kind == "switch" and point.index is not None:
+                    switch = self.loaded.alfils_data.switches[point.index] if self.loaded.alfils_data is not None else None
+                    if switch is None:
+                        return False
+                    pixel_x, pixel_y = switch.pixel_x, switch.pixel_y
+                    object_info_index = switch.object_info_index
+                    if spec.field == "switch_position":
+                        pixel_x, pixel_y = self._parse_position(value)
+                    elif spec.field == "switch_object":
+                        object_info_index = int(value)
+                    else:
+                        return False
+                    session = session.plan_set_switch(point.index, pixel_x=pixel_x, pixel_y=pixel_y, object_info_index=object_info_index)
+                    self._apply_edit_session(session)
+                    return True
+                if point.kind == "destructable_object" and point.index is not None:
+                    if not 0 <= point.index < len(self.loaded.map_data.items):
+                        return False
+                    item = self.loaded.map_data.items[point.index]
+                    if not item.is_object:
+                        return False
+                    pixel_x, pixel_y = item.pixel_x, item.pixel_y
+                    raw_id = item.object_or_weapon_info_index
+                    if spec.field == "destructible_position":
+                        pixel_x, pixel_y = self._parse_position(value)
+                    elif spec.field == "destructible_object":
+                        raw_id = int(value)
+                    else:
+                        return False
+                    session = session.plan_set_map_item(item.index, pixel_x=pixel_x, pixel_y=pixel_y, raw_id=raw_id)
+                    self._apply_edit_session(session)
+                    return True
+                if point.kind != "puzzle" or point.index is None:
+                    return False
+                puzzle = self.loaded.map_data.puzzles[point.index]
+                cond_types = list(puzzle.condition_function_indices)
+                cond_params = list(puzzle.condition_params)
+                pixel_x, pixel_y = puzzle.pixel_x, puzzle.pixel_y
+                effect_type, effect_param = puzzle.effect_function_index, puzzle.effect_param
+                remove = puzzle.remove_after_effect
+                if spec.field == "puzzle_position":
+                    pixel_x, pixel_y = self._parse_position(value)
+                elif spec.field == "puzzle_effect_type":
+                    effect_type = self._choice_index(value)
+                elif spec.field == "puzzle_effect_param":
+                    effect_param = int(value)
+                elif spec.field == "puzzle_remove":
+                    remove = bool(int(value))
+                elif spec.field.startswith("cond") and spec.field.endswith("_type"):
+                    slot = int(spec.field[4])
+                    cond_types[slot] = self._choice_index(value)
+                elif spec.field.startswith("cond") and spec.field.endswith("_param"):
+                    slot = int(spec.field[4])
+                    cond_params[slot] = int(value)
+                else:
+                    return False
+                session = session.plan_set_puzzle(
+                    point.index,
+                    condition_types=tuple(cond_types),  # type: ignore[arg-type]
+                    condition_params=tuple(cond_params),  # type: ignore[arg-type]
+                    pixel_x=pixel_x,
+                    pixel_y=pixel_y,
+                    effect_type=effect_type,
+                    effect_param=effect_param,
+                    remove_after_effect=remove,
+                )
+            else:
+                return False
+            self._apply_edit_session(session)
+            return True
+        except (AssertionError, ValueError, IndexError, TypeError) as exc:
+            if show_errors:
+                messagebox.showerror("GODS entity editor", f"Could not edit property.\n\n{exc}")
+            return False
+
+    def _plan_bound_switch_move(self, session: EditSession, item, pixel_x: int, pixel_y: int, raw_id: int) -> EditSession:
+        if self.loaded is None or self.loaded.alfils_data is None or not item.is_object:
+            return session
+        for switch in self.loaded.alfils_data.active_switches:
+            if switch.pixel_x == item.pixel_x and switch.pixel_y == item.pixel_y and switch.object_info_index == item.object_or_weapon_info_index:
+                return session.plan_set_switch(switch.index, pixel_x=pixel_x, pixel_y=pixel_y, object_info_index=raw_id)
+        return session
+
+    def _update_pending_preview_image(self) -> None:
+        if self.loaded is None:
+            return
+        self.map_canvas.set_image(self._render_image_with_pending_previews(self.loaded.render_result.image))
+
+    def _render_image_with_pending_previews(self, base_image):
+        if self.loaded is None or self.loaded.sprite_bank is None or not self.pending_property_edits:
+            return base_image
+        preview = base_image.copy().convert("RGBA")
+        for edit in self.pending_property_edits:
+            sprite = None
+            x_y: tuple[int, int] | None = None
+            raw_id: int | None = None
+            if edit.spec.field == "item_position" and edit.spec.ref[0] == "item" and isinstance(edit.spec.ref[1], MapItemSelection):
+                item = self._map_item_for_selection(edit.spec.ref[1])
+                if item is None:
+                    continue
+                raw_id = item.object_or_weapon_info_index
+                x_y = self._parse_position(edit.value)
+            elif edit.spec.field == "destructible_position" and edit.spec.ref[0] == "point" and isinstance(edit.spec.ref[1], LogicPoint):
+                point = edit.spec.ref[1]
+                if point.index is None or not 0 <= point.index < len(self.loaded.map_data.items):
+                    continue
+                item = self.loaded.map_data.items[point.index]
+                if not item.is_object:
+                    continue
+                raw_id = item.object_or_weapon_info_index
+                x_y = self._parse_position(edit.value)
+            elif edit.spec.field == "item_create":
+                raw_text, x_text, y_text = edit.value.split(",", 2)
+                raw_id = int(raw_text)
+                x_y = (int(x_text), int(y_text))
+            if raw_id is None or x_y is None:
+                continue
+            if raw_id >= 192:
+                sprite = self.loaded.sprite_bank.weapon_sprite(raw_id - 192)
+            else:
+                sprite = self.loaded.sprite_bank.object_sprite(raw_id)
+            if sprite is None:
+                continue
+            preview.alpha_composite(sprite, x_y)
+        return preview
+
+    @staticmethod
+    def _parse_position(value: str) -> tuple[int, int]:
+        x_text, y_text = value.replace(" ", "").split(",", 1)
+        return int(x_text), int(y_text)
+
+    @staticmethod
+    def _parse_cell(value: str) -> tuple[int, int]:
+        x, y = LevelViewer._parse_position(value)
+        return x, y
 
     def _populate_properties_tree_for_ref(self, tree: ttk.Treeview, ref: tuple[str, object]) -> None:
         if self.loaded is None:
@@ -1747,8 +2817,41 @@ class LevelViewer(ttk.Frame):
     def _insert_property_section(self, title: str, source: str, *, open: bool = True) -> str:
         return self.property_tree.insert("", tk.END, text=title, values=("",), open=open)
 
-    def _insert_property(self, parent: str, field: str, value: object, source: str, *, open: bool = True) -> str:
-        return self.property_tree.insert(parent, tk.END, text=field, values=(str(value),), open=open)
+    def _insert_property(self, parent: str, field: str, value: object, source: str, *, open: bool = True, edit: PropertyEditSpec | None = None) -> str:
+        iid = self.property_tree.insert(parent, tk.END, text=field, values=(str(value),), open=open)
+        if edit is not None and getattr(self, "property_tree", None) is getattr(self, "browser_property_tree", None):
+            self.property_edit_specs[iid] = edit
+            self.property_tree.item(iid, tags=("editable",))
+            self.property_tree.tag_configure("editable", foreground="#005bbb")
+            pending = self._pending_edit_for_spec(edit)
+            if pending is not None:
+                self.property_tree.set(iid, "value", f"{self._display_value_for_spec(pending.spec, pending.value)} *")
+                self._set_pending_tags(self.property_tree, iid, "pending_delete" if self._is_delete_edit(pending.spec) else "pending_changed")
+        return iid
+
+    def _pending_edit_for_spec(self, spec: PropertyEditSpec) -> PendingPropertyEdit | None:
+        for edit in reversed(self.pending_property_edits):
+            if edit.spec.ref != spec.ref:
+                continue
+            if edit.spec.field == spec.field:
+                return edit
+            if spec.field.startswith("event_cell:") and edit.spec.field == f"event_delete_cell:{spec.field.split(':', 1)[1]}":
+                return edit
+            if edit.spec.field == "event_delete":
+                return edit
+        return None
+
+    def _set_pending_tags(self, tree: ttk.Treeview, iid: str, tag: str | None) -> None:
+        tags = [existing for existing in tree.item(iid, "tags") if existing not in {"pending_changed", "pending_delete", "pending_new"}]
+        if tag is not None:
+            tags.append(tag)
+        tree.item(iid, tags=tuple(tags))
+
+    def _refresh_pending_marks(self) -> None:
+        for tree in self.entity_trees.values():
+            for iid, ref in self.entity_refs.items():
+                if tree.exists(iid):
+                    self._set_pending_tags(tree, iid, self._pending_tag_for_ref(ref))
 
     def _insert_property_rows(self, parent: str, rows: tuple[PropertyRow, ...]) -> None:
         for row in rows:
@@ -1803,6 +2906,19 @@ class LevelViewer(ttk.Frame):
             text += ", ..."
         return text
 
+    def _insert_event_trigger_cells(self, parent: str, event_index: int, *, title: str = "Map triggers") -> str:
+        ref = ("event", event_index)
+        cells = self.loaded.logic_graph.event_cells.get(event_index, ()) if self.loaded is not None and self.loaded.logic_graph is not None else ()
+        trigger_root = self._insert_property(parent, title, f"{len(cells)} cell{'s' if len(cells) != 1 else ''}", "map layer B", open=True)
+        if not cells:
+            self._insert_property(trigger_root, "Status", "effect-only / no direct map trigger cells", "map layer B")
+            self._insert_property(trigger_root, "Add cell", "Pick on map", "map layer B", edit=PropertyEditSpec("event_add_cell", ref, pick=True))
+            return trigger_root
+        for index, (cell_x, cell_y) in enumerate(cells):
+            self._insert_property(trigger_root, f"Cell {index}", f"{cell_x},{cell_y}", "map layer B", edit=PropertyEditSpec(f"event_cell:{index}", ref, pick=True))
+        self._insert_property(trigger_root, "Add cell", "Pick on map", "map layer B", edit=PropertyEditSpec("event_add_cell", ref, pick=True))
+        return trigger_root
+
     def _wave_target_for_event(self, event) -> tuple[str, object, str, str] | None:
         if self.loaded is None or self.loaded.alfils_data is None or event is None:
             return None
@@ -1818,15 +2934,25 @@ class LevelViewer(ttk.Frame):
         return None
 
     def _insert_wave_fields(self, parent: str, prefix: str, wave, enemy_kind: str, source: str) -> None:
+        ref = ("wave", EnemySelection(prefix, wave.index, None, getattr(wave, "pixel_x", None), getattr(wave, "pixel_y", None)))
+        editable_ww = prefix == "WW"
         self._insert_property(parent, "Wave", f"{prefix}{wave.index}", source)
-        self._insert_property(parent, "Enemy count", wave.enemy_count, source)
-        self._insert_property(parent, "Health", wave.health, source)
-        self._insert_property(parent, "Enemy info", self._enemy_summary(wave, enemy_kind), "enemy table")
-        self._insert_property(parent, "Reward", self._wave_reward_text(wave), "item table")
+        if hasattr(wave, "pixel_x") and hasattr(wave, "pixel_y"):
+            self._insert_property(parent, "Position", f"{wave.pixel_x},{wave.pixel_y}", source, edit=PropertyEditSpec("wave_position", ref) if editable_ww else None)
+            if editable_ww:
+                self._insert_property(parent, "Pick position", "click map", source, edit=PropertyEditSpec("wave_position", ref, pick=True))
+        self._insert_property(parent, "Enemy count", wave.enemy_count, source, edit=PropertyEditSpec("wave_enemy_count", ref) if editable_ww else None)
+        self._insert_property(parent, "Health", wave.health, source, edit=PropertyEditSpec("wave_health", ref) if editable_ww else None)
+        self._insert_property(parent, "Enemy info", self._enemy_summary(wave, enemy_kind), "enemy table", edit=PropertyEditSpec("wave_enemy_info", ref, atlas=f"enemy_{enemy_kind}") if editable_ww else None)
+        self._insert_property(parent, "Reward", self._wave_reward_text(wave), "item table", edit=PropertyEditSpec("wave_reward", ref, atlas="walking_wave_reward") if editable_ww else None)
         if hasattr(wave, "spawn_delay"):
-            self._insert_property(parent, "Spawn delay", getattr(wave, "spawn_delay"), source)
+            self._insert_property(parent, "Spawn delay", getattr(wave, "spawn_delay"), source, edit=PropertyEditSpec("wave_spawn_delay", ref) if editable_ww else None)
         if hasattr(wave, "facing"):
-            self._insert_property(parent, "Facing", getattr(wave, "facing"), source)
+            self._insert_property(parent, "Facing", getattr(wave, "facing"), source, edit=PropertyEditSpec("wave_facing", ref, ("0", "1")) if editable_ww else None)
+        if editable_ww:
+            self._insert_property(parent, "Action/function", getattr(wave, "function_index_unknown"), source, edit=PropertyEditSpec("wave_function", ref))
+            self._insert_property(parent, "Missile type", getattr(wave, "missile_type"), source, edit=PropertyEditSpec("wave_missile_type", ref))
+            self._insert_property(parent, "Speed", getattr(wave, "speed_value"), source, edit=PropertyEditSpec("wave_speed", ref))
         if prefix == "FW":
             self._insert_property(parent, "Flying path", f"FP{wave.flying_path_index}", ".PAT")
         info = self._enemy_info(wave, enemy_kind)
@@ -1836,38 +2962,50 @@ class LevelViewer(ttk.Frame):
             self._insert_property(parent, "Action", info.action_type, "enemy table")
 
     def _insert_puzzle_effect_fields(self, parent: str, puzzle) -> None:
+        point = self.loaded.logic_graph.point_for_puzzle(puzzle.index) if self.loaded is not None and self.loaded.logic_graph is not None else None
+        ref = ("point", point or LogicPoint(puzzle.pixel_x, puzzle.pixel_y, f"P{puzzle.index}", "puzzle", puzzle.index))
+        effect_choices = tuple(f"{index}: {puzzle_effect_name(index)}" for index in range(15))
         effect = self._insert_property(parent, "Effect", self._effect_text(puzzle), "decoded", open=True)
-        self._insert_property(effect, "Raw type", f"{puzzle.effect_function_index}: {puzzle_effect_name(puzzle.effect_function_index)}", "map")
-        self._insert_property(effect, "Raw param", puzzle.effect_param, "map")
-        self._insert_property(effect, "Remove item after effect", int(puzzle.remove_after_effect), "map")
+        self._insert_property(effect, "Type", f"{puzzle.effect_function_index}: {puzzle_effect_name(puzzle.effect_function_index)}", "map", edit=PropertyEditSpec("puzzle_effect_type", ref, effect_choices))
+        self._insert_property(effect, "Remove item after effect", int(puzzle.remove_after_effect), "map", edit=PropertyEditSpec("puzzle_remove", ref, ("0", "1")))
 
         effect_type = puzzle.effect_function_index
         param = puzzle.effect_param
         if effect_type == 0:
+            self._insert_property(effect, "Object id", self._object_ref(param), "map", edit=PropertyEditSpec("puzzle_effect_param", ref, atlas="object"))
             target = self._insert_object_table_properties(effect, param)
-            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+            self._insert_property(target, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
         elif effect_type == 1:
+            self._insert_property(effect, "Weapon id", self._weapon_ref(param), "map", edit=PropertyEditSpec("puzzle_effect_param", ref, atlas="weapon"))
             target = self._insert_weapon_table_properties(effect, param)
-            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+            self._insert_property(target, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
         elif effect_type in (2, 9):
             target = self._insert_property(effect, "Door", f"DOOR{puzzle.index}", "decoded", open=True)
-            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+            self._insert_property(target, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
             self._insert_property(target, "Size", "32x48", "map")
         elif effect_type == 5:
-            target = self._insert_property(effect, "Event", self._event_trigger_text(param - 1), "PALFILS", open=True)
-            self._insert_property(target, "Trigger cells", self._event_cells_text(param - 1), "map")
+            target = self._insert_property(effect, "Event", self._event_trigger_text(param - 1), "PALFILS", open=True, edit=PropertyEditSpec("puzzle_effect_param", ref))
+            self._insert_event_trigger_cells(target, param - 1)
         elif effect_type == 6:
             target = self._insert_property(effect, "Target", "type-4 destructible", "decoded", open=True)
-            self._insert_property(target, "Search origin", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(target, "Search origin", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+            self._insert_property(target, "Pick origin", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
         elif effect_type in (7, 8):
-            target = self._insert_property(effect, "Trapdoor", f"D{param}", "PALFILS", open=True)
+            target = self._insert_property(effect, "Trapdoor", f"D{param}", "PALFILS", open=True, edit=PropertyEditSpec("puzzle_effect_param", ref))
             if self.loaded is not None and self.loaded.alfils_data is not None and 0 <= param < len(self.loaded.alfils_data.trapdoors):
                 trapdoor = self.loaded.alfils_data.trapdoors[param]
                 self._insert_property(target, "Position", f"{trapdoor.pixel_x},{trapdoor.pixel_y}", "PALFILS")
         elif effect_type == 10:
-            self._insert_property(effect, "Weapon", self._weapon_name(param), "weapon table")
+            self._insert_property(effect, "Weapon", self._weapon_ref(param), "weapon table", edit=PropertyEditSpec("puzzle_effect_param", ref, atlas="weapon"))
+        else:
+            self._insert_property(effect, "Param", param, "map", edit=PropertyEditSpec("puzzle_effect_param", ref))
 
     def _insert_puzzle_condition_fields(self, parent: str, puzzle) -> None:
+        ref = ("point", self.loaded.logic_graph.point_for_puzzle(puzzle.index) if self.loaded is not None and self.loaded.logic_graph is not None else LogicPoint(puzzle.pixel_x, puzzle.pixel_y, f"P{puzzle.index}", "puzzle", puzzle.index))
+        condition_choices = tuple(f"{index}: {condition_type_name(index)}" for index in range(17))
         conditions = self._insert_property(parent, "Conditions", "all must pass", "map puzzle", open=True)
         for slot, (condition_type, param) in enumerate(zip(puzzle.condition_function_indices, puzzle.condition_params)):
             condition_parent = self._insert_property(
@@ -1877,25 +3015,29 @@ class LevelViewer(ttk.Frame):
                 "decoded",
                 open=True,
             )
-            self._insert_property(condition_parent, "Type", f"{condition_type}: {condition_type_name(condition_type)}", "map")
+            self._insert_property(condition_parent, "Type", f"{condition_type}: {condition_type_name(condition_type)}", "map", edit=PropertyEditSpec(f"cond{slot}_type", ref, condition_choices))
+            self._insert_property(condition_parent, "Param", param, "map", edit=PropertyEditSpec(f"cond{slot}_param", ref))
             self._insert_puzzle_condition_param_fields(condition_parent, condition_type, param)
 
     def _insert_event_effect_tree(self, parent: str, event) -> None:
+        ref = ("event", event.index)
+        type_choices = tuple(["-1: Unused", *[f"{index}: {name}" for index, name in sorted(EVENT_TYPE_NAMES.items())]])
         effect = self._insert_property(parent, "Effect", event.type_name, "PALFILS", open=True)
-        self._insert_property(effect, "Raw type", event.event_type_index, "PALFILS")
-        self._insert_property(effect, "Raw param", event.param, "PALFILS")
+        type_value = f"{event.event_type_index if event.event_type_index is not None else -1}: {event.type_name}"
+        self._insert_property(effect, "Type", type_value, "PALFILS", edit=PropertyEditSpec("event_type", ref, type_choices))
+        param_choices = self._event_param_choices(event.event_type_index if event.event_type_index is not None else -1)
 
         wave_target = self._wave_target_for_event(event)
         if wave_target is not None:
             prefix, wave, enemy_kind, title = wave_target
-            param = self._insert_property(effect, "Param: wave", f"{prefix}{event.param}", "PALFILS", open=True)
+            param = self._insert_property(effect, "Wave", f"{prefix}{event.param}", "PALFILS", open=True, edit=PropertyEditSpec("event_param", ref, param_choices))
             self._insert_property(param, "Meaning", title, "decoded")
             self._insert_wave_fields(param, prefix, wave, enemy_kind, "PALFILS")
             return
 
         if event.event_type_index == 2 and self.loaded.map_data is not None:
             puzzle = self.loaded.map_data.puzzles[event.param] if 0 <= event.param < len(self.loaded.map_data.puzzles) else None
-            param = self._insert_property(effect, "Param: puzzle", f"P{event.param}", "map puzzle", open=True)
+            param = self._insert_property(effect, "Puzzle", f"P{event.param}", "map puzzle", open=True, edit=PropertyEditSpec("event_param", ref, param_choices))
             if puzzle is None:
                 self._insert_property(param, "Status", "puzzle slot unavailable", "map")
                 return
@@ -1907,7 +3049,7 @@ class LevelViewer(ttk.Frame):
 
         if event.event_type_index is not None and 6 <= event.event_type_index <= 9 and self.loaded.alfils_data is not None:
             block = self.loaded.alfils_data.moving_blocks[event.param] if 0 <= event.param < len(self.loaded.alfils_data.moving_blocks) else None
-            param = self._insert_property(effect, "Param: moving block", f"MB{event.param}", "PALFILS", open=True)
+            param = self._insert_property(effect, "Moving block", f"MB{event.param}", "PALFILS", open=True, edit=PropertyEditSpec("event_param", ref, param_choices))
             if block is None:
                 self._insert_property(param, "Status", "moving block slot unavailable", "PALFILS")
                 return
@@ -1918,19 +3060,22 @@ class LevelViewer(ttk.Frame):
             return
 
         if event.event_type_index == 5:
-            self._insert_property(effect, "Param: checkpoint", event.param, "PALFILS")
+            self._insert_property(effect, "Checkpoint", event.param, "PALFILS", edit=PropertyEditSpec("event_param", ref, param_choices))
         elif event.event_type_index == 10:
-            self._insert_property(effect, "Param: guardian", event.param, "PALFILS")
+            self._insert_property(effect, "Guardian", event.param, "PALFILS", edit=PropertyEditSpec("event_param", ref, param_choices))
         elif event.event_type_index == 11:
             self._insert_property(effect, "Status", "inactive event slot", "PALFILS")
         else:
-            self._insert_property(effect, "Decoded param", event.param, "PALFILS")
+            self._insert_property(effect, "Raw param", event.param, "PALFILS")
 
     def _insert_event_properties(self, event_index: int) -> None:
         assert self.loaded is not None
         event = self.loaded.alfils_data.event(event_index) if self.loaded.alfils_data is not None else None
         root = self._insert_property_section(f"Map trigger E{event_index}", "layer B / PALFILS")
-        self._insert_property(root, "Trigger cells", self._event_cells_text(event_index), "map")
+        pending_tag = self._pending_tag_for_ref(("event", event_index))
+        if pending_tag is not None:
+            self._set_pending_tags(self.property_tree, root, pending_tag)
+        self._insert_event_trigger_cells(root, event_index)
         if event is None:
             self._insert_property(root, "Status", "unused PALFILS event slot", "PALFILS")
             return
@@ -1980,9 +3125,13 @@ class LevelViewer(ttk.Frame):
         if item is None:
             self._insert_property(root, "Status", "map item unavailable", "map")
             return
+        ref = ("item", selection)
+        id_atlas = "weapon_raw" if item.is_weapon else "object"
+        id_value = self._weapon_ref(item.object_or_weapon_info_index - 192) if item.is_weapon else self._object_ref(item.object_or_weapon_info_index)
         self._insert_property(root, "Kind", "weapon" if item.is_weapon else "object", "map")
-        self._insert_property(root, "Position", f"{item.pixel_x},{item.pixel_y}", "map")
-        self._insert_property(root, "Raw ID", f"{item.object_or_weapon_info_index} / 0x{item.object_or_weapon_info_index:04X}", "map")
+        self._insert_property(root, "Position", f"{item.pixel_x},{item.pixel_y}", "map", edit=PropertyEditSpec("item_position", ref))
+        self._insert_property(root, "Pick position", "click map", "map", edit=PropertyEditSpec("item_position", ref, pick=True))
+        self._insert_property(root, "Object/weapon id", id_value, "map", edit=PropertyEditSpec("item_raw_id", ref, atlas=id_atlas))
         sprite = self._map_item_sprite(item)
         if sprite is not None:
             self._insert_property(root, "Sprite box", f"{sprite.width}x{sprite.height}px", "sprite")
@@ -2053,9 +3202,11 @@ class LevelViewer(ttk.Frame):
 
         if point.kind == "switch" and 0 <= point.index < len(alfils.switches):
             record = alfils.switches[point.index]
+            ref = ("point", point)
             section = self._insert_property_section(f"Switch S{record.index}", "PALFILS")
-            self._insert_property(section, "Object", self._object_name(record.object_info_index), "object table")
-            self._insert_property(section, "Position", f"{record.pixel_x},{record.pixel_y}", "PALFILS")
+            self._insert_property(section, "Object", self._object_ref(record.object_info_index), "object table", edit=PropertyEditSpec("switch_object", ref, atlas="object"))
+            self._insert_property(section, "Position", f"{record.pixel_x},{record.pixel_y}", "PALFILS", edit=PropertyEditSpec("switch_position", ref))
+            self._insert_property(section, "Pick position", "click map item", "PALFILS", edit=PropertyEditSpec("switch_position", ref, pick=True))
             self._insert_property(section, "Physical binding", self._switch_binding_text(record.index), "logic")
             return
 
@@ -2105,19 +3256,33 @@ class LevelViewer(ttk.Frame):
 
         if point.kind == "destructable_object" and 0 <= point.index < len(self.loaded.map_data.items):
             item = self.loaded.map_data.items[point.index]
+            ref = ("point", point)
             section = self._insert_property_section(f"Destructible target {point.label}", "map item")
             self._insert_property(section, "Map item", f"I{item.index}", "map")
-            self._insert_property(section, "Position", f"{item.pixel_x},{item.pixel_y}", "map")
+            self._insert_property(section, "Position", f"{item.pixel_x},{item.pixel_y}", "map", edit=PropertyEditSpec("destructible_position", ref))
+            self._insert_property(section, "Pick position", "click map item", "map", edit=PropertyEditSpec("destructible_position", ref, pick=True))
             if item.is_object:
+                self._insert_property(section, "Object", self._object_ref(item.object_or_weapon_info_index), "object table", edit=PropertyEditSpec("destructible_object", ref, atlas="object"))
                 self._insert_object_table_properties(section, item.object_or_weapon_info_index)
+            if self.loaded.logic_graph is not None:
+                incoming = [
+                    edge.source.label
+                    for edge in self.loaded.logic_graph.direct_edges_for_point(point)
+                    if edge.source.kind == "puzzle" and self.loaded.logic_graph._same_graph_node(edge.target, point)
+                ]
+                self._insert_property(section, "Destroy effects", ", ".join(incoming) if incoming else "none", "logic")
             return
 
         if point.kind == "spawned_destructable_object" and 0 <= point.index < len(self.loaded.map_data.puzzles):
             puzzle = self.loaded.map_data.puzzles[point.index]
+            puzzle_point = self.loaded.logic_graph.point_for_puzzle(puzzle.index) if self.loaded.logic_graph is not None else None
+            ref = ("point", puzzle_point or LogicPoint(puzzle.pixel_x, puzzle.pixel_y, f"P{puzzle.index}", "puzzle", puzzle.index))
             section = self._insert_property_section(f"Spawned destructible target {point.label}", "map puzzle")
             self._insert_property(section, "Source puzzle", f"P{puzzle.index}", "map")
-            self._insert_property(section, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+            self._insert_property(section, "Spawn position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+            self._insert_property(section, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
             if puzzle.effect_function_index == 0:
+                self._insert_property(section, "Spawn object", self._object_ref(puzzle.effect_param), "map", edit=PropertyEditSpec("puzzle_effect_param", ref, atlas="object"))
                 self._insert_object_table_properties(section, puzzle.effect_param)
             return
 
@@ -2236,10 +3401,7 @@ class LevelViewer(ttk.Frame):
             value = self._event_trigger_text(event_index)
             return ConditionParamPresentation(
                 value,
-                (
-                    PropertyRow("Event", value, "PALFILS"),
-                    PropertyRow("Trigger cells", self._event_cells_text(event_index), "map"),
-                ),
+                (PropertyRow("Event", value, "PALFILS"),),
             )
         if condition_type in (7, 8):
             value = f"{param}/24"
@@ -2264,7 +3426,7 @@ class LevelViewer(ttk.Frame):
         if condition_type in (5, 6):
             presentation = self._condition_param_presentation(condition_type, param)
             target = self._insert_property(parent, "Event", presentation.rows[0].value, presentation.rows[0].source, open=True)
-            self._insert_property_rows(target, presentation.rows[1:])
+            self._insert_event_trigger_cells(target, param - 1)
             return
         if condition_type in (11, 12):
             presentation = self._condition_param_presentation(condition_type, param)
@@ -2297,6 +3459,73 @@ class LevelViewer(ttk.Frame):
         if event is None:
             return f"E{event_index}"
         return f"E{event_index} ({self._event_action_text(event)})"
+
+    @staticmethod
+    def _event_param_field_name(event_type: int) -> str:
+        return {
+            0: "Flying wave",
+            1: "Walking wave",
+            2: "Puzzle",
+            3: "Intel walking wave",
+            4: "Intel flying wave",
+            5: "Checkpoint",
+            6: "Moving block",
+            7: "Moving block",
+            8: "Moving block",
+            9: "Moving block",
+            10: "Guardian",
+        }.get(event_type, "Param")
+
+    @staticmethod
+    def _event_param_display_value(event_type: int, param: int) -> str:
+        if event_type == 0:
+            return f"FW{param}"
+        if event_type == 1:
+            return f"WW{param}"
+        if event_type == 2:
+            return f"P{param}"
+        if event_type == 3:
+            return f"IW{param}"
+        if event_type == 4:
+            return f"IF{param}"
+        if 6 <= event_type <= 9:
+            return f"MB{param}"
+        if event_type == 10:
+            return f"G{param}"
+        return str(param)
+
+    def _event_param_choices(self, event_type: int) -> tuple[str, ...]:
+        """Return valid existing target IDs for an event parameter, when enumerable."""
+        if self.loaded is None:
+            return ()
+        alfils = self.loaded.alfils_data
+        map_data = self.loaded.map_data
+
+        if alfils is not None:
+            if event_type == 0:
+                return tuple(f"FW{index}" for index in range(len(alfils.flying_waves)))
+            if event_type == 1:
+                return tuple(f"WW{index}" for index in range(len(alfils.walking_waves)))
+            if event_type == 3:
+                return tuple(f"IW{index}" for index in range(len(alfils.intel_walking_waves)))
+            if event_type == 4:
+                return tuple(f"IF{index}" for index in range(len(alfils.intel_flying_waves)))
+            if 6 <= event_type <= 9:
+                return tuple(f"MB{index}" for index in range(len(alfils.moving_blocks)))
+
+        if event_type == 2 and map_data is not None:
+            return tuple(f"P{puzzle.index}" for puzzle in map_data.active_puzzles)
+
+        # Checkpoints and guardians are numeric ids in the event table, but this
+        # viewer currently has no level-local collection that defines their valid ids.
+        return ()
+
+    def _normalise_event_param_for_type(self, event_type: int, param: int) -> int:
+        choices = self._event_param_choices(event_type)
+        if not choices:
+            return param
+        valid_params = tuple(self._parse_event_param_value(event_type, choice) for choice in choices)
+        return param if param in valid_params else valid_params[0]
 
     def _condition_text(self, condition_type: int, param: int) -> str:
         name = condition_type_name(condition_type)
@@ -2379,8 +3608,11 @@ class LevelViewer(ttk.Frame):
             return
 
         puzzle = self.loaded.map_data.puzzles[puzzle_index]
+        point = self.loaded.logic_graph.point_for_puzzle(puzzle.index) if self.loaded.logic_graph is not None else None
+        ref = ("point", point or LogicPoint(puzzle.pixel_x, puzzle.pixel_y, f"P{puzzle.index}", "puzzle", puzzle.index))
         root = self._insert_property_section(f"Puzzle P{puzzle.index}", "map puzzle")
-        self._insert_property(root, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map")
+        self._insert_property(root, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
+        self._insert_property(root, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
         if 0 <= puzzle.string_index < len(self.loaded.map_data.puzzle_strings):
             text = self.loaded.map_data.puzzle_strings[puzzle.string_index]
             if text:
@@ -2465,6 +3697,7 @@ class LevelViewer(ttk.Frame):
     def _populate_entity_tree(self) -> None:
         if not hasattr(self, "entity_group_stack"):
             return
+        preserved_group = self.selected_entity_group
         for frame in self.entity_group_frames.values():
             frame.destroy()
         for button in self.entity_group_buttons.values():
@@ -2493,7 +3726,61 @@ class LevelViewer(ttk.Frame):
             for entity in entities:
                 detail, position, ref_kind, ref_value = self._entity_browser_row(entity)
                 self._insert_entity(tree, entity.label, detail, position, ref_kind, ref_value)
+        self._insert_pending_entity_rows()
+        if preserved_group in self.entity_group_frames:
+            self._show_entity_group(preserved_group)
         self._update_entity_tree_highlight()
+
+    def _insert_pending_entity_rows(self) -> None:
+        for edit in self.pending_property_edits:
+            if edit.spec.field == "item_create":
+                tree = self.entity_trees.get("Map items") or self._create_entity_group_tab("Map items")
+                iid = f"pending:{len(self.entity_refs)}"
+                tree.insert("", tk.END, iid=iid, text="NEW item", values=(self._display_value_for_spec(edit.spec, edit.value), "pending"), tags=("pending_new",))
+                self.entity_refs[iid] = edit.spec.ref
+            elif edit.spec.field == "event_create":
+                event_index = int(edit.spec.ref[1])
+                tree = self.entity_trees.get("Events") or self._create_entity_group_tab("Events")
+                iid = f"pending:{len(self.entity_refs)}"
+                tree.insert("", tk.END, iid=iid, text=f"E{event_index} NEW", values=(self._display_value_for_spec(edit.spec, edit.value), "pending"), tags=("pending_new",))
+                self.entity_refs[iid] = ("pending_event", event_index)
+
+    def _select_pending_event_row(self, event_index: int) -> None:
+        tree = self.entity_trees.get("Events")
+        if tree is None:
+            return
+        target_ref = ("pending_event", event_index)
+        for item_id, ref in self.entity_refs.items():
+            if ref == target_ref and tree.exists(item_id):
+                self._show_entity_group("Events")
+                tree.selection_set(item_id)
+                tree.focus(item_id)
+                tree.see(item_id)
+                self._populate_properties_tree_for_pending_event(event_index)
+                return
+
+    def _populate_properties_tree_for_pending_event(self, event_index: int) -> None:
+        self.property_tree.delete(*self.property_tree.get_children())
+        ref = ("pending_event", event_index)
+        root = self._insert_property_section(f"Pending event E{event_index}", "pending", open=True)
+        type_choices = tuple(["-1: Unused", *[f"{index}: {name}" for index, name in sorted(EVENT_TYPE_NAMES.items())]])
+        for edit in self.pending_property_edits:
+            if edit.spec.field != "event_create" or int(edit.spec.ref[1]) != event_index:
+                continue
+            type_text, param_text = edit.value.split(",", 1)
+            event_type = int(type_text)
+            param = int(param_text)
+            self._insert_property(root, "Effect", self._event_action_text_from_values(event_type, param), "pending")
+            self._insert_property(root, "Type", f"{type_text}: {EVENT_TYPE_NAMES.get(event_type, f'Type {type_text}')}", "pending", edit=PropertyEditSpec("pending_event_type", ref, type_choices))
+            param_choices = self._event_param_choices(event_type)
+            self._insert_property(
+                root,
+                self._event_param_field_name(event_type),
+                self._event_param_display_value(event_type, param),
+                "pending",
+                edit=PropertyEditSpec("pending_event_param", ref, param_choices),
+            )
+            return
 
     def _puzzle_links_for_map_item(self, item_index: int, *, recursive: bool = False) -> tuple[int, ...]:
         if self.loaded is None or self.loaded.logic_graph is None:
@@ -2754,6 +4041,26 @@ class LevelViewer(ttk.Frame):
             detail = f"{path.kind}, nodes={len(path.deltas)}, waves={wave_count}, trigger cells={trigger_count}"
             return detail, "path-only", "path", path.index
 
+        if group == "Spawn effects":
+            point = payload
+            puzzle_index = int(entity.key.index)
+            puzzle_point = graph.point_for_puzzle(puzzle_index) or point
+            puzzle = map_data.puzzles[puzzle_index]
+            detail = self._effect_text(puzzle)
+            return detail, self._position_text(point.pixel_x, point.pixel_y), "point", puzzle_point
+
+        if group == "Destructible targets":
+            point = payload
+            detail = self._logic_target_detail_text(point)
+            puzzle_index = int(entity.key.index)
+            if point.kind == "destructable_object":
+                return detail, self._position_text(point.pixel_x, point.pixel_y), "item", MapItemSelection(point.index)
+            if point.kind == "spawned_destructable_object":
+                puzzle_point = graph.point_for_puzzle(puzzle_index) or point
+                return detail, self._position_text(point.pixel_x, point.pixel_y), "point", puzzle_point
+            puzzle_point = graph.point_for_puzzle(puzzle_index) or point
+            return detail, self._position_text(point.pixel_x, point.pixel_y), "point", puzzle_point
+
         if group == "Physical logic targets" or group.startswith("Logic targets:") or group.startswith("Logic:"):
             point = payload
             detail = self._logic_target_detail_text(point)
@@ -2787,7 +4094,7 @@ class LevelViewer(ttk.Frame):
         if point.kind in {
             "map_item",
             "switch_item",
-            "teleport_stone",
+                "teleport_stone",
             "map_object_source",
             "map_weapon_source",
             "destructable_object",
@@ -2900,10 +4207,17 @@ class LevelViewer(ttk.Frame):
             return
         related = self._related_entity_refs_for_selection()
         for item_id, ref in self.entity_refs.items():
-            tags = ("related",) if ref in related else ()
             for tree in self.entity_trees.values():
                 if tree.exists(item_id):
-                    tree.item(item_id, tags=tags)
+                    tags = []
+                    pending_tag = self._pending_tag_for_ref(ref)
+                    if pending_tag is None:
+                        pending_tag = next((tag for tag in tree.item(item_id, "tags") if tag == "pending_new"), None)
+                    if pending_tag is not None:
+                        tags.append(pending_tag)
+                    if ref in related:
+                        tags.append("related")
+                    tree.item(item_id, tags=tuple(tags))
                     break
         self._update_context_tree(related)
 
@@ -2956,6 +4270,16 @@ class LevelViewer(ttk.Frame):
             self.property_tree.delete(*self.property_tree.get_children())
             self.property_tree.insert("", tk.END, text="Selection", values=("None",))
             return
+        if ref[0] == "item_raw":
+            self.property_tree.delete(*self.property_tree.get_children())
+            root = self._insert_property_section("Pending new map item", "pending", open=True)
+            for edit in self.pending_property_edits:
+                if edit.spec.ref == ref and edit.spec.field == "item_create":
+                    self._insert_property(root, "Create", self._display_value_for_spec(edit.spec, edit.value), "pending")
+            return
+        if ref[0] == "pending_event":
+            self._populate_properties_tree_for_pending_event(int(ref[1]))
+            return
         self._populate_properties_tree_for_ref(self.property_tree, ref)
 
     def _on_entity_selected(self, _event: tk.Event) -> None:
@@ -2969,6 +4293,12 @@ class LevelViewer(ttk.Frame):
         if ref is None:
             return
         ref_kind, value = ref
+        if ref_kind == "item_raw":
+            self.inspect_var.set("Pending new item will exist after Apply.")
+            return
+        if ref_kind == "pending_event":
+            self.inspect_var.set("Pending new event will exist after Apply.")
+            return
         if ref_kind == "event":
             self._clear_auto_flying_path_overlay()
             event_index = int(value)
@@ -3066,6 +4396,12 @@ class LevelViewer(ttk.Frame):
                 break
 
     def _on_map_double_clicked(self, image_x: int, image_y: int) -> None:
+        if self.suppress_next_map_double_click:
+            self.suppress_next_map_double_click = False
+            return
+        if self.pending_pick is not None:
+            self._on_map_clicked(image_x, image_y)
+            return
         self._on_map_clicked(image_x, image_y)
         self._sync_entity_browser_to_selection()
 
@@ -3077,6 +4413,12 @@ class LevelViewer(ttk.Frame):
         cell_x = image_x // MAP_CELL_WIDTH
         cell_y = image_y // MAP_CELL_HEIGHT
         if not (0 <= cell_x < 128 and 0 <= cell_y < 64):
+            return
+        if self.pending_pick is not None:
+            spec = self.pending_pick
+            self._clear_pick_mode()
+            self.suppress_next_map_double_click = True
+            self._queue_property_edit(spec, self._pick_value_for_property(spec, image_x, image_y, cell_x, cell_y))
             return
         map_data = self.loaded.map_data
         a = map_data.layer_a_at(cell_x, cell_y)
@@ -3171,3 +4513,67 @@ class LevelViewer(ttk.Frame):
             self._rerender_loaded()
         elif b >= 3 or logic_point_text:
             self._update_logic_text()
+
+    def _pick_value_for_property(self, spec: PropertyEditSpec, image_x: int, image_y: int, cell_x: int, cell_y: int) -> str:
+        if spec.field == "item_create":
+            ref_kind, raw_id = spec.ref
+            if ref_kind == "item_raw":
+                return f"{int(raw_id)},{image_x},{image_y}"
+        if spec.field.startswith("event_cell:") or spec.field == "event_add_cell":
+            return f"{cell_x},{cell_y}"
+        if spec.field == "puzzle_position":
+            snapped = self._snap_puzzle_pick_position(spec, image_x, image_y)
+            if snapped is not None:
+                return f"{snapped[0]},{snapped[1]}"
+        if spec.field == "switch_position":
+            snapped = self._snap_switch_pick_position(image_x, image_y)
+            if snapped is not None:
+                return f"{snapped[0]},{snapped[1]}"
+        if spec.field == "destructible_position":
+            snapped = self._snap_destructible_pick_position(image_x, image_y)
+            if snapped is not None:
+                return f"{snapped[0]},{snapped[1]}"
+        return f"{image_x},{image_y}"
+
+    def _snap_switch_pick_position(self, image_x: int, image_y: int) -> tuple[int, int] | None:
+        hit = self._pick_map_item(image_x, image_y)
+        if hit is None:
+            return None
+        item = self._map_item_for_selection(hit)
+        if item is None or not item.is_object:
+            return None
+        return item.pixel_x, item.pixel_y
+
+    def _snap_destructible_pick_position(self, image_x: int, image_y: int) -> tuple[int, int] | None:
+        hit = self._pick_map_item(image_x, image_y)
+        if hit is None or self.loaded is None or self.loaded.object_table is None:
+            return None
+        item = self._map_item_for_selection(hit)
+        if item is None or not item.is_object:
+            return None
+        info = self.loaded.object_table.get(item.object_or_weapon_info_index)
+        if info is None or not info.is_destructable:
+            return None
+        return item.pixel_x, item.pixel_y
+
+    def _snap_puzzle_pick_position(self, spec: PropertyEditSpec, image_x: int, image_y: int) -> tuple[int, int] | None:
+        if self.loaded is None:
+            return None
+        ref_kind, ref_value = spec.ref
+        if ref_kind != "point" or not isinstance(ref_value, LogicPoint) or ref_value.kind != "puzzle" or ref_value.index is None:
+            return None
+        if not (0 <= ref_value.index < len(self.loaded.map_data.puzzles)):
+            return None
+        puzzle = self.loaded.map_data.puzzles[ref_value.index]
+        if puzzle.effect_function_index != 6:
+            return None
+        hit = self._pick_map_item(image_x, image_y)
+        if hit is None:
+            return None
+        item = self._map_item_for_selection(hit)
+        if item is None or not item.is_object or self.loaded.object_table is None:
+            return None
+        info = self.loaded.object_table.get(item.object_or_weapon_info_index)
+        if info is None or not info.is_destructable:
+            return None
+        return item.pixel_x, item.pixel_y
