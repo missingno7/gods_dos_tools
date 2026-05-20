@@ -3424,6 +3424,15 @@ class LevelViewer(ttk.Frame):
             target = self._insert_object_table_properties(effect, param)
             self._insert_property(target, "Position", f"{puzzle.pixel_x},{puzzle.pixel_y}", "map", edit=PropertyEditSpec("puzzle_position", ref))
             self._insert_property(target, "Pick position", "click map", "map", edit=PropertyEditSpec("puzzle_position", ref, pick=True))
+            info = self.loaded.object_table.get(param) if self.loaded is not None and self.loaded.object_table is not None else None
+            if info is not None and info.is_teleport_stone:
+                self._insert_teleport_stone_mechanism_properties(
+                    effect,
+                    source_kind="puzzle",
+                    source_index=puzzle.index,
+                    pixel_x=puzzle.pixel_x,
+                    pixel_y=puzzle.pixel_y,
+                )
         elif effect_type == 1:
             self._insert_property(effect, "Weapon id", self._weapon_ref(param), "map", edit=PropertyEditSpec("puzzle_effect_param", ref, atlas="weapon"))
             target = self._insert_weapon_table_properties(effect, param)
@@ -3602,6 +3611,14 @@ class LevelViewer(ttk.Frame):
                 self._insert_property(table, "Value", info.value, "object table")
                 if info.effect_name is not None:
                     self._insert_property(table, "Usable effect", f"{info.effect_name} ({info.effect_index})", "object table")
+                if info.is_teleport_stone:
+                    self._insert_teleport_stone_mechanism_properties(
+                        table,
+                        source_kind="item",
+                        source_index=item.index,
+                        pixel_x=item.pixel_x,
+                        pixel_y=item.pixel_y,
+                    )
         if self.loaded is not None and self.loaded.logic_graph is not None:
             graph = self.loaded.logic_graph
             roles = self._insert_property_section("Decoded roles", "logic")
@@ -3834,6 +3851,120 @@ class LevelViewer(ttk.Frame):
         return (
             PropertyRow("Object", self._object_name(switch.object_info_index), "object table"),
             PropertyRow("Position", f"{switch.pixel_x},{switch.pixel_y}", "PALFILS"),
+        )
+
+    def _palfil_teleports_for_stone_x(self, pixel_x: int):
+        if self.loaded is None or self.loaded.alfils_data is None:
+            return ()
+        return tuple(teleport for teleport in self.loaded.alfils_data.active_teleports if teleport.src_pixel_x == pixel_x)
+
+    def _hardcoded_teleport_stone_sources(self) -> tuple[tuple[str, int, int, int], ...]:
+        """Return fixed teleport-stone sources that fall through to the PC hardcoded sequence.
+
+        PALFILS teleport records have an explicit source-X binding.  The remaining teleport
+        stones use the executable's special destination sequence.  The original game does not
+        store a normal destination id on the puzzle/item; the most useful editor view is to
+        enumerate the unbound fixed stone sources in map-table order, then puzzle-table order,
+        and line them up with HT0, HT1, ... .
+        """
+        if self.loaded is None or self.loaded.object_table is None:
+            return ()
+        object_table = self.loaded.object_table
+        sources: list[tuple[str, int, int, int]] = []
+
+        for item in self.loaded.map_data.active_items:
+            if not item.is_object:
+                continue
+            info = object_table.get(item.object_or_weapon_info_index)
+            if info is None or not info.is_teleport_stone:
+                continue
+            if self._palfil_teleports_for_stone_x(item.pixel_x):
+                continue
+            sources.append(("item", item.index, item.pixel_x, item.pixel_y))
+
+        for puzzle in self.loaded.map_data.active_puzzles:
+            if puzzle.effect_function_index != 0:
+                continue
+            info = object_table.get(puzzle.effect_param)
+            if info is None or not info.is_teleport_stone:
+                continue
+            if self._palfil_teleports_for_stone_x(puzzle.pixel_x):
+                continue
+            sources.append(("puzzle", puzzle.index, puzzle.pixel_x, puzzle.pixel_y))
+
+        return tuple(sources)
+
+    def _hardcoded_teleport_for_stone_source(self, source_kind: str, source_index: int):
+        if self.loaded is None:
+            return None, None
+        sources = self._hardcoded_teleport_stone_sources()
+        sequence_index = None
+        for index, (kind, source_id, _x, _y) in enumerate(sources):
+            if kind == source_kind and source_id == source_index:
+                sequence_index = index
+                break
+        if sequence_index is None:
+            return None, None
+        records = special_teleport_destinations(self.loaded.resource.level)
+        if sequence_index >= len(records):
+            return sequence_index, None
+        return sequence_index, records[sequence_index]
+
+    def _insert_teleport_stone_mechanism_properties(
+        self,
+        parent: str,
+        *,
+        source_kind: str,
+        source_index: int,
+        pixel_x: int,
+        pixel_y: int,
+    ) -> None:
+        section = self._insert_property_section("Teleport stone mechanism", "decoded", open=True)
+        self._insert_property(section, "Stone source", f"{source_kind} {source_index}", "decoded")
+        self._insert_property(section, "Activation position", f"{pixel_x},{pixel_y}", "map")
+
+        palfils_matches = self._palfil_teleports_for_stone_x(pixel_x)
+        if palfils_matches:
+            self._insert_property(section, "Binding mode", "PALFILS source-X record", "decoded")
+            for teleport in palfils_matches:
+                target = self._insert_property(
+                    section,
+                    f"T{teleport.index}",
+                    f"srcX={teleport.src_pixel_x} → destination ({teleport.marker_x},{teleport.marker_y})",
+                    "PALFILS",
+                    open=True,
+                )
+                self._insert_property(target, "Raw destination", f"{teleport.dst_pixel_x},{teleport.dst_pixel_y}", "PALFILS")
+                self._insert_property(target, "Normalized destination", f"{teleport.normalized_dst_pixel_x},{teleport.normalized_dst_pixel_y}", "decoded")
+            return
+
+        sequence_index, record = self._hardcoded_teleport_for_stone_source(source_kind, source_index)
+        self._insert_property(section, "Binding mode", "hardcoded PC teleport sequence", "decoded")
+        if sequence_index is None:
+            self._insert_property(section, "Resolved target", "not in fixed teleport-stone sequence", "decoded")
+            self._insert_property(section, "Note", "No PALFILS srcX match and no sequence slot was inferred.", "decoded")
+            return
+        self._insert_property(section, "Sequence slot", f"#{sequence_index}", "decoded")
+        if record is None:
+            self._insert_property(section, "Resolved target", f"HT{sequence_index} missing from extracted PC table", "decoded")
+            return
+        target = self._insert_property(
+            section,
+            "Resolved target",
+            f"HT{record.index} → ({record.pixel_x},{record.pixel_y})",
+            "PC table",
+            open=True,
+        )
+        self._insert_property(target, "Coded value", f"0x{record.coded:04X}", "PC table")
+        if record.unpacked_game_offset is not None:
+            self._insert_property(target, "GAME.EXE offset", f"0x{record.unpacked_game_offset:X}", "PC table")
+        else:
+            self._insert_property(target, "GAME.EXE offset", "patched / explicit special value", "PC table")
+        self._insert_property(
+            section,
+            "Editor warning",
+            "No destination id is stored on this puzzle/item; this is inferred from unbound teleport-stone order.",
+            "decoded",
         )
 
 

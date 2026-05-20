@@ -400,6 +400,14 @@ The renderer and Entity Browser can now show these as **Hardcoded teleport desti
 (`HT#`). They are intentionally rendered as destinations only: the exact runtime pairing is
 sequence/order-driven rather than a direct static `srcX` association like PALFILS teleports.
 
+For editor UX, unbound fixed teleport-stone sources are now presented as an inferred special
+sequence: map-item teleport stones in item-table order, followed by puzzle-spawned teleport stones
+in puzzle-table order, excluding any stone whose X coordinate already binds to a PALFILS teleport
+record.  The resulting sequence is shown as `HT0`, `HT1`, ... with an explicit warning that the
+destination id is not stored on the puzzle or item itself.  Example: in Level 1A/1B, I16 is the
+first unbound teleport stone and resolves to `HT0`; P21 spawns OBJ54 at (814,677) and resolves to
+`HT1` at (1040,624).
+
 ### Intelligent-enemy objective locations
 
 The older viewer's white objective rectangles are also present directly in the DOS executable.
